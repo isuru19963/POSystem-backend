@@ -1,0 +1,90 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build output
+dist/
+build/
+out/
+
+# Environment files
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS – macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.AppleDouble
+.LSOverride
+
+# OS – Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# IDE – VS Code
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json.template
+
+# IDE – JetBrains / IntelliJ
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# TypeScript
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# Uploads (local file storage)
+uploads/
+
+# NestJS
+.nest/
+
+# TypeORM migrations (generated output)
+# src/database/migrations/*.js
+
+# BullMQ / Redis (local data)
+dump.rdb
+
+# AWS / S3 credentials (should live in .env only)
+*.pem
+*.key
+credentials
+
+# Package manager lock files (keep only one)
+# yarn.lock
+# pnpm-lock.yaml
+
+# Misc
+*.pid
+*.seed
+*.pid.lock
+.cache/
+tmp/
+temp/
