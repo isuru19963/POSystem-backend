@@ -5,8 +5,10 @@ import { Vendor } from './vendor.entity';
 export enum PricingRuleType {
   /** (NECC price [PO date - 1] + margin) × pack size */
   PREMIUM_FRESH = 'premium_fresh',
-  /** MRP - vendor margin */
+  /** MRP × (1 - margin) */
   DR_GOOD_EGGS = 'dr_good_eggs',
+  /** Same formula as dr_good_eggs: MRP × (1 - margin) */
+  PURE_O_FRESH = 'pure_o_fresh',
   /** Custom formula stored as JSON */
   CUSTOM = 'custom',
 }
@@ -38,6 +40,21 @@ export class VendorPricingRule extends BaseEntity {
   /** Optional: NECC city for Premium Fresh rules */
   @Column({ name: 'necc_city', nullable: true })
   neccCity?: string;
+
+  /**
+   * Optional: when set, this Premium Fresh rule only applies to POs with this exact ship-to
+   * (matches purchase_orders.shipping_location). Null = all locations for the vendor/brand.
+   */
+  @Column({ name: 'shipping_location', nullable: true })
+  shippingLocation?: string;
+
+  /**
+   * Optional: pack size for Premium Fresh per-pack-size margin rules.
+   * When set, this rule only applies to SKUs with this pack size.
+   * When null, applies to all pack sizes of the brand.
+   */
+  @Column({ name: 'pack_size', type: 'int', nullable: true })
+  packSize?: number;
 
   /** Effective from date */
   @Column({ name: 'effective_from', type: 'date' })

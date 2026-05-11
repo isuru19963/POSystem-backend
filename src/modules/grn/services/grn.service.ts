@@ -1,4 +1,4 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
@@ -10,6 +10,35 @@ import {
 } from '../../../database/entities';
 import { AlertsService } from '../../alerts/services/alerts.service';
 import { AlertType } from '../../../database/entities';
+import { CreateGrnDto } from '../dto/create-grn.dto';
+import { CreateGrnManualDto, ManualGrnLineItemDto } from '../dto/create-grn-manual.dto';
+import { GrnPdfExtractionService, GrnExtractionResult, GrnExtractedLineItem } from './grn-pdf-extraction.service';
+import { messageIdSearchVariants } from '../../../common/utils/email-message-id.util';
+
+function parseFlexibleDate(dateStr?: string): Date | undefined {
+  if (!dateStr) return undefined;
+  const raw = String(dateStr).trim();
+  if (!raw || /^0+$/.test(raw)) return undefined;
+  if (/^\d{10,13}$/.test(raw)) {
+    const n = Number(raw);
+    const ms = raw.length === 10 ? n * 1000 : n;
+    const tsDate = new Date(ms);
+    if (!isNaN(tsDate.getTime()) && tsDate.getUTCFullYear() >= 2000) return tsDate;
+    return undefined;
+  }
+  const dmy = raw.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/);
+  if (dmy) {
+    const [, d, m, y] = dmy;
+    const iso = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+    const parsed = new Date(iso);
+    if (!isNaN(parsed.getTime()) && parsed.getUTCFullYear() >= 2000) return parsed;
+    return undefined;
+  }
+  const normalized = raw.replace(/\b([ap])\.?m\.?\b/gi, '$1m');
+  const parsed = new Date(normalized);
+  if (isNaN(parsed.getTime()) || parsed.getUTCFullYear() < 2000) return undefined;
+  return parsed;
+}
 
 export interface ThreeWayMatchResult {
   grnId: string;
@@ -40,6 +69,7 @@ export class GrnService {
     @InjectRepository(Delivery)
     private readonly deliveryRepo: Repository<Delivery>,
     private readonly alertsService: AlertsService,
+    private readonly grnPdfService: GrnPdfExtractionService,
   ) {}
 
   /**
@@ -68,6 +98,7 @@ export class GrnService {
     const deliveryTotals = new Map<string, number>();
     for (const delivery of deliveries) {
       for (const li of delivery.lineItems) {
+        if (!li.skuId) continue;
         const current = deliveryTotals.get(li.skuId) || 0;
         deliveryTotals.set(li.skuId, current + li.deliveredQuantity);
       }
@@ -78,7 +109,7 @@ export class GrnService {
 
     for (const grnItem of grn.lineItems) {
       const poItem = po.lineItems.find((li) => li.skuId === grnItem.skuId);
-      const deliveredQty = deliveryTotals.get(grnItem.skuId) || 0;
+      const deliveredQty = (grnItem.skuId ? deliveryTotals.get(grnItem.skuId) : undefined) || 0;
 
       const isMatch =
         poItem &&
@@ -88,7 +119,7 @@ export class GrnService {
       if (!isMatch) allMatched = false;
 
       items.push({
-        skuCode: grnItem.sku?.code || grnItem.skuId,
+        skuCode: grnItem.sku?.code || grnItem.itemCode || grnItem.skuId || 'unknown',
         poQuantity: poItem?.quantity || 0,
         deliveredQuantity: deliveredQty,
         grnQuantity: grnItem.receivedQuantity,
@@ -128,10 +159,286 @@ export class GrnService {
     };
   }
 
+  async createGrn(dto: CreateGrnDto): Promise<Grn> {
+    const po = await this.poRepo.findOne({ where: { id: dto.purchaseOrderId } });
+    if (!po) throw new NotFoundException(`PO ${dto.purchaseOrderId} not found`);
+
+    const grn = this.grnRepo.create({
+      purchaseOrderId: dto.purchaseOrderId,
+      grnNumber: dto.grnNumber,
+      grnDate: new Date(dto.grnDate),
+      status: GrnStatus.RECEIVED,
+      lineItems: dto.lineItems.map((li) =>
+        this.grnLineItemRepo.create({
+          skuId: li.skuId,
+          receivedQuantity: li.receivedQuantity,
+          acceptedQuantity: li.acceptedQuantity,
+          rejectedQuantity: li.rejectedQuantity ?? li.receivedQuantity - li.acceptedQuantity,
+          rejectionReason: li.rejectionReason,
+        }),
+      ),
+    });
+
+    return this.grnRepo.save(grn);
+  }
+
+  async findById(id: string): Promise<Grn> {
+    const grn = await this.grnRepo.findOne({
+      where: { id },
+      relations: ['purchaseOrder', 'lineItems', 'lineItems.sku'],
+    });
+    if (!grn) throw new NotFoundException(`GRN ${id} not found`);
+    return grn;
+  }
+
+  async updateStatus(id: string, status: GrnStatus): Promise<Grn> {
+    const grn = await this.grnRepo.findOne({ where: { id } });
+    if (!grn) throw new NotFoundException(`GRN ${id} not found`);
+    await this.grnRepo.update(id, { status });
+    return this.findById(id);
+  }
+
+  async updateNotes(id: string, notes: string | undefined): Promise<Grn> {
+    const grn = await this.grnRepo.findOne({ where: { id } });
+    if (!grn) throw new NotFoundException(`GRN ${id} not found`);
+    await this.grnRepo.update(id, { notes });
+    return this.findById(id);
+  }
+
   async findAll(): Promise<Grn[]> {
     return this.grnRepo.find({
       relations: ['purchaseOrder', 'lineItems'],
       order: { createdAt: 'DESC' },
     });
   }
+
+  async findByEmailMessageId(messageId: string | undefined): Promise<Grn | null> {
+    const variants = messageIdSearchVariants(messageId);
+    if (!variants.length) return null;
+    return this.grnRepo.findOne({
+      where: variants.map((emailMessageId) => ({ emailMessageId })),
+    });
+  }
+
+  /**
+   * Ingest a GRN PDF from email: extract, match PO by number, persist with email dedupe.
+   * Idempotent when the same email Message-Id or GRN number already exists.
+   */
+  async createFromEmailPdf(params: {
+    emailMessageId?: string;
+    rawFileKey?: string;
+    pdfBuffer: Buffer;
+  }): Promise<Grn | null> {
+    const msgId = params.emailMessageId?.trim();
+    if (msgId) {
+      const byEmail = await this.findByEmailMessageId(msgId);
+      if (byEmail) {
+        this.logger.log(`GRN email already processed (Message-Id): ${msgId}`);
+        return byEmail;
+      }
+    }
+
+    const extracted = await this.grnPdfService.extract(params.pdfBuffer);
+    const poNumber = extracted.poNumber?.trim();
+    const grnNumber = extracted.grnNumber?.trim();
+    if (!poNumber || !grnNumber) {
+      throw new BadRequestException('GRN PDF is missing PO number or GRN number after extraction');
+    }
+    if (!extracted.lineItems?.length) {
+      throw new BadRequestException('GRN PDF has no line items after extraction');
+    }
+
+    const existingNum = await this.grnRepo.findOne({ where: { grnNumber } });
+    if (existingNum) {
+      this.logger.warn(`GRN number ${grnNumber} already exists; skipping email import`);
+      return existingNum;
+    }
+
+    const grnDateIso =
+      parseFlexibleDate(extracted.grnDate)?.toISOString().slice(0, 10) ??
+      new Date().toISOString().slice(0, 10);
+
+    const lineItems = extracted.lineItems.map((li) => this.mapExtractedLineToManual(li));
+    for (const li of lineItems) {
+      if (!li.itemCode) {
+        throw new BadRequestException('GRN PDF has a line item without item code');
+      }
+    }
+
+    return this.createGrnManual({
+      poNumber,
+      grnNumber,
+      grnDate: grnDateIso,
+      lineItems,
+      emailMessageId: msgId,
+      rawFileKey: params.rawFileKey,
+    });
+  }
+
+  private mapExtractedLineToManual(li: GrnExtractedLineItem): ManualGrnLineItemDto {
+    const accepted = Math.max(0, Math.round(Number(li.acceptedQty) || 0));
+    const r = Number(li.receivedQty);
+    const j = Number(li.rejectedQty);
+    const hasReceived = Number.isFinite(r);
+    const hasRejected = Number.isFinite(j);
+
+    let receivedQuantity = hasReceived ? Math.max(0, Math.round(r)) : accepted;
+    let rejectedQuantity = hasRejected ? Math.max(0, Math.round(j)) : Math.max(0, receivedQuantity - accepted);
+
+    if (!hasReceived && hasRejected) {
+      receivedQuantity = accepted + rejectedQuantity;
+    }
+
+    return {
+      itemCode: String(li.itemCode || '').trim(),
+      itemName: li.itemName?.trim(),
+      receivedQuantity,
+      acceptedQuantity: accepted,
+      rejectedQuantity,
+      rejectionReason: li.rejectionReason,
+    };
+  }
+
+  /**
+   * Manually create a GRN by PO number (no delivery required).
+   * Line items are matched to PO items by itemCode.
+   */
+  async createGrnManual(dto: CreateGrnManualDto): Promise<Grn> {
+    if (dto.emailMessageId?.trim()) {
+      const dupEmail = await this.findByEmailMessageId(dto.emailMessageId);
+      if (dupEmail) {
+        throw new BadRequestException(`This email was already imported as GRN ${dupEmail.grnNumber}`);
+      }
+    }
+
+    const po = await this.poRepo.findOne({
+      where: { poNumber: dto.poNumber },
+      relations: ['lineItems'],
+    });
+    if (!po) throw new NotFoundException(`PO ${dto.poNumber} not found`);
+
+    // Guard against duplicate GRN number
+    const existing = await this.grnRepo.findOne({ where: { grnNumber: dto.grnNumber } });
+    if (existing) throw new BadRequestException(`GRN number ${dto.grnNumber} already exists`);
+
+    const grn = this.grnRepo.create({
+      purchaseOrderId: po.id,
+      grnNumber: dto.grnNumber,
+      grnDate: new Date(dto.grnDate),
+      status: GrnStatus.RECEIVED,
+      emailMessageId: dto.emailMessageId?.trim() || undefined,
+      rawFileKey: dto.rawFileKey,
+      lineItems: dto.lineItems.map((li) => {
+        const poItem = po.lineItems.find((p) => p.itemCode === li.itemCode);
+        return this.grnLineItemRepo.create({
+          skuId: poItem?.skuId,
+          itemCode: li.itemCode,
+          itemName: li.itemName || poItem?.itemName,
+          receivedQuantity: li.receivedQuantity,
+          acceptedQuantity: li.acceptedQuantity,
+          rejectedQuantity: li.rejectedQuantity ?? (li.receivedQuantity - li.acceptedQuantity),
+          rejectionReason: li.rejectionReason,
+        });
+      }),
+    });
+
+    return this.grnRepo.save(grn);
+  }
+
+  /**
+   * Compare PO ordered quantities against GRN received quantities.
+   * Finds PO by PO number, gathers all linked GRNs and returns
+   * a per-item breakdown showing full/partial/not-received status.
+   */
+  async compareByPoNumber(poNumber: string): Promise<PoGrnComparisonResult> {
+    const po = await this.poRepo.findOne({
+      where: { poNumber },
+      relations: ['lineItems', 'lineItems.sku', 'vendor', 'grns', 'grns.lineItems'],
+    });
+    if (!po) throw new NotFoundException(`PO ${poNumber} not found`);
+
+    // Aggregate received qty per itemCode across all GRNs
+    const receivedMap = new Map<string, number>();
+    for (const grn of po.grns) {
+      for (const li of grn.lineItems) {
+        const key = li.itemCode || li.skuId || '';
+        receivedMap.set(key, (receivedMap.get(key) ?? 0) + li.acceptedQuantity);
+      }
+    }
+
+    const items: PoGrnComparisonResult['items'] = po.lineItems.map((li) => {
+      const key = li.itemCode || li.skuId || '';
+      const received = receivedMap.get(key) ?? 0;
+      const ordered = li.quantity;
+      let fulfillmentStatus: 'full' | 'partial' | 'not_received';
+      if (received === 0) fulfillmentStatus = 'not_received';
+      else if (received >= ordered) fulfillmentStatus = 'full';
+      else fulfillmentStatus = 'partial';
+
+      return {
+        itemCode: li.itemCode,
+        itemName: li.itemName || li.sku?.name || li.itemCode,
+        hsnCode: li.hsnCode,
+        orderedQty: ordered,
+        receivedQty: received,
+        pendingQty: Math.max(0, ordered - received),
+        poPrice: Number(li.poPrice),
+        fulfillmentStatus,
+      };
+    });
+
+    const totalOrdered = items.reduce((s, i) => s + i.orderedQty, 0);
+    const totalReceived = items.reduce((s, i) => s + i.receivedQty, 0);
+
+    return {
+      poNumber: po.poNumber,
+      poDate: po.poDate,
+      vendor: po.vendor?.name || '',
+      shippingLocation: po.shippingLocation,
+      expectedDeliveryDate: po.expectedDeliveryDate,
+      totalAmount: po.totalAmount ? Number(po.totalAmount) : undefined,
+      grnCount: po.grns.length,
+      totalOrdered,
+      totalReceived,
+      fulfillmentPercent: totalOrdered > 0 ? Math.round((totalReceived / totalOrdered) * 100) : 0,
+      overallStatus: totalReceived === 0 ? 'not_received' : totalReceived >= totalOrdered ? 'full' : 'partial',
+      items,
+    };
+  }
+
+  /**
+   * Extract GRN data from a PDF. Does NOT write to the database.
+   * Returns the raw extraction result for the user to review and confirm.
+   */
+  async extractGrnPdf(fileBuffer: Buffer): Promise<GrnExtractionResult> {
+    const extraction = await this.grnPdfService.extract(fileBuffer);
+    this.logger.log(
+      `Extracted GRN PDF: number=${extraction.grnNumber}, PO=${extraction.poNumber}, items=${extraction.lineItems.length}`,
+    );
+    return extraction;
+  }
+}
+
+export interface PoGrnComparisonResult {
+  poNumber: string;
+  poDate: Date;
+  vendor: string;
+  shippingLocation: string;
+  expectedDeliveryDate?: Date;
+  totalAmount?: number;
+  grnCount: number;
+  totalOrdered: number;
+  totalReceived: number;
+  fulfillmentPercent: number;
+  overallStatus: 'full' | 'partial' | 'not_received';
+  items: Array<{
+    itemCode: string;
+    itemName: string;
+    hsnCode?: string;
+    orderedQty: number;
+    receivedQty: number;
+    pendingQty: number;
+    poPrice: number;
+    fulfillmentStatus: 'full' | 'partial' | 'not_received';
+  }>;
 }

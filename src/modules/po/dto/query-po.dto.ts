@@ -21,4 +21,8 @@ export class QueryPoDto {
   @IsOptional()
   @IsString()
   poNumber?: string;
+
+  @IsOptional()
+  @IsString()
+  search?: string;
 }

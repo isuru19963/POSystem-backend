@@ -10,6 +10,7 @@ import { EmailModule } from '../email/email.module';
 import { StorageModule } from '../storage/storage.module';
 import { WhatsappModule } from '../whatsapp/whatsapp.module';
 import { PoModule } from '../modules/po/po.module';
+import { GrnModule } from '../modules/grn/grn.module';
 
 @Module({
   imports: [
@@ -27,6 +28,7 @@ import { PoModule } from '../modules/po/po.module';
     StorageModule,
     WhatsappModule,
     PoModule,
+    GrnModule,
   ],
   providers: [PoProcessingProcessor, AlertDispatchProcessor, EmailMonitorScheduler],
   exports: [BullModule],

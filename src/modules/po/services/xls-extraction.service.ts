@@ -4,6 +4,7 @@ import {
   PdfExtractionResult,
   ExtractedLineItem,
 } from './pdf-extraction.service';
+import { isOwnCompanyName } from './own-company';
 
 /**
  * XLS Extraction Service
@@ -249,8 +250,14 @@ export class XlsExtractionService {
       });
     }
 
+    // In Zepto CSVs, "VendorName" is OUR company (Deccan Agro = the seller).
+    // The actual customer issuing the PO is Zepto, so override when our own
+    // name accidentally appears as the vendor.
+    const finalVendorName =
+      vendorName && !isOwnCompanyName(vendorName) ? vendorName : 'Zepto';
+
     return {
-      vendorName,
+      vendorName: finalVendorName,
       poNumber,
       poDate,
       shippingLocation: deliveryLocation,
@@ -309,11 +316,47 @@ export class XlsExtractionService {
       const cells = getString(rows[i]);
       const joined = cells.join(' ');
 
+      // Check Billing/Shipping Address FIRST (before Vendor Name search) so company name gets priority
+      if (cells.some((c) => /Billing\s*Address/i.test(c))) {
+        // Next row has the addresses
+        if (i + 1 < rows.length) {
+          const addrCells = getString(rows[i + 1]);
+          // Find the company names in billing/shipping addresses
+          for (let c = 0; c < addrCells.length; c++) {
+            if (addrCells[c].includes('CLOUDSTORE') || addrCells[c].includes('ENTERPRISE') || addrCells[c].includes('MOKSH')) {
+              if (!billingAddress) {
+                billingAddress = addrCells[c];
+                // Extract company name from billing address (first line before newline or address details)
+                const companyName = addrCells[c].split('\n')[0].trim();
+                // Skip if billing address shows our own company (we are the seller, not the buyer)
+                if (companyName && !isOwnCompanyName(companyName)) {
+                  // ALWAYS use billing address company name - override supplier name
+                  vendorName = companyName;
+                }
+              } else if (!shippingAddress) {
+                shippingAddress = addrCells[c];
+              }
+            }
+          }
+          const addr = shippingAddress || billingAddress;
+          if (addr) {
+            shippingLocation = this.extractLocationFromAddress(addr);
+          }
+        }
+      }
+
       // Search through all cells for key-value patterns
       for (let c = 0; c < cells.length; c++) {
         const cell = cells[c];
         // Find the next non-empty cell as value
         const nextVal = this.findNextNonEmpty(cells, c + 1);
+
+        // Only extract "Vendor Name:" if we haven't found vendor from billing address yet
+        if (/Vendor\s*Name/i.test(cell) && nextVal && !vendorName) {
+          if (!isOwnCompanyName(nextVal)) {
+            vendorName = nextVal;
+          }
+        }
 
         if (/PO\s*No/i.test(cell) && nextVal) {
           // PO number may be a few cells away
@@ -342,38 +385,22 @@ export class XlsExtractionService {
         }
       }
 
-      // Vendor info block (multi-line cell with GSTIN, not CLOUDSTORE)
-      for (const cell of cells) {
-        if (
-          cell.includes('GSTIN') &&
-          !cell.includes('CLOUDSTORE') &&
-          cell.length > 50
-        ) {
-          const gstMatch = cell.match(/GSTIN\s*:(\S+)/i);
-          if (gstMatch) vendorGstin = gstMatch[1];
-          const vendorLines = cell.split('\n').map((l) => l.trim());
-          vendorName = vendorLines[0] || '';
-        }
-      }
-
-      // Billing/Shipping Address
-      if (cells.some((c) => /Billing\s*Address/i.test(c))) {
-        // Next row has the addresses
-        if (i + 1 < rows.length) {
-          const addrCells = getString(rows[i + 1]);
-          // Find the CLOUDSTORE cells
-          for (let c = 0; c < addrCells.length; c++) {
-            if (addrCells[c].includes('CLOUDSTORE')) {
-              if (!billingAddress) {
-                billingAddress = addrCells[c];
-              } else if (!shippingAddress) {
-                shippingAddress = addrCells[c];
-              }
+      // Vendor info block (multi-line cell with GSTIN, not CLOUDSTORE) - fallback if vendorName not set
+      if (!vendorName) {
+        for (const cell of cells) {
+          if (
+            cell.includes('GSTIN') &&
+            !cell.includes('CLOUDSTORE') &&
+            cell.length > 50
+          ) {
+            const vendorLines = cell.split('\n').map((l) => l.trim());
+            const candidate = vendorLines[0] || '';
+            // Skip our own company; keep looking for the actual buyer.
+            if (candidate && !isOwnCompanyName(candidate)) {
+              const gstMatch = cell.match(/GSTIN\s*:(\S+)/i);
+              if (gstMatch) vendorGstin = gstMatch[1];
+              vendorName = candidate;
             }
-          }
-          const addr = shippingAddress || billingAddress;
-          if (addr) {
-            shippingLocation = this.extractLocationFromAddress(addr);
           }
         }
       }
@@ -415,7 +442,7 @@ export class XlsExtractionService {
           ) {
             break;
           }
-          if (cells.filter((c) => c).length < 3) break;
+          if (cells.filter((c) => c).length < 3) continue;
           continue;
         }
 

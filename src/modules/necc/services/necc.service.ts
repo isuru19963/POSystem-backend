@@ -1,7 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, Between, MoreThanOrEqual } from 'typeorm';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { NeccPrice } from '../../../database/entities';
@@ -16,9 +16,9 @@ export class NeccService {
   ) {}
 
   /**
-   * Fetch NECC rates daily at 6 AM IST
+   * Fetch NECC rates daily at 12:30 AM UTC (6 AM IST)
    */
-  @Cron(CronExpression.EVERY_DAY_AT_6AM)
+  @Cron('30 0 * * *')  // 00:30 UTC = 6 AM IST
   async fetchDailyRates(): Promise<void> {
     this.logger.log('Fetching daily NECC rates...');
     try {
@@ -156,7 +156,12 @@ export class NeccService {
   }
 
   async getPrice(city: string, date: Date): Promise<NeccPrice | null> {
-    return this.neccPriceRepo.findOne({ where: { city, date } });
+    return this.neccPriceRepo
+      .createQueryBuilder('np')
+      .where('LOWER(np.city) = LOWER(:city)', { city })
+      .andWhere('np.date <= :date', { date: date.toISOString().slice(0, 10) })
+      .orderBy('np.date', 'DESC')
+      .getOne();
   }
 
   async getPriceHistory(

@@ -5,19 +5,43 @@ import {
   Sku,
   Route,
   ShippingLocationMapping,
+  PurchaseOrder,
+  PurchaseOrderLineItem,
+  Delivery,
+  DeliveryLineItem,
+  Grn,
+  GrnLineItem,
+  Vehicle,
+  Driver,
   AuditLog,
+  User,
+  NotificationContact,
+  VendorPricingRule,
 } from '../../database/entities';
 import { AdminController } from './controllers/admin.controller';
 import { AdminService } from './services/admin.service';
+import { AuthModule } from '../auth/auth.module';
 
 @Module({
   imports: [
+    AuthModule,
     TypeOrmModule.forFeature([
       Vendor,
       Sku,
       Route,
       ShippingLocationMapping,
+      PurchaseOrder,
+      PurchaseOrderLineItem,
+      Delivery,
+      DeliveryLineItem,
+      Grn,
+      GrnLineItem,
+      Vehicle,
+      Driver,
       AuditLog,
+      User,
+      NotificationContact,
+      VendorPricingRule,
     ]),
   ],
   controllers: [AdminController],

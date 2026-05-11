@@ -1,15 +1,24 @@
-import { Injectable, Logger, NotFoundException } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, FindOptionsWhere } from 'typeorm';
+import { Repository, Between, FindOptionsWhere, In, ILike } from 'typeorm';
 import {
   PurchaseOrder,
   PoStatus,
   Vendor,
   PurchaseOrderLineItem,
   Sku,
+  Delivery,
+  DeliveryLineItem,
+  Grn,
+  GrnLineItem,
+  NotificationContact,
 } from '../../../database/entities';
 import { QueryPoDto } from '../dto/query-po.dto';
 import { ExtractedLineItem } from './pdf-extraction.service';
+import { isOwnCompanyName } from './own-company';
+import { WhatsappService } from '../../../whatsapp/whatsapp.service';
+import { ValidationService } from '../../validation/services/validation.service';
+import { messageIdSearchVariants } from '../../../common/utils/email-message-id.util';
 
 @Injectable()
 export class PoService {
@@ -24,16 +33,39 @@ export class PoService {
     private readonly lineItemRepo: Repository<PurchaseOrderLineItem>,
     @InjectRepository(Sku)
     private readonly skuRepo: Repository<Sku>,
+    @InjectRepository(Delivery)
+    private readonly deliveryRepo: Repository<Delivery>,
+    @InjectRepository(DeliveryLineItem)
+    private readonly deliveryLineItemRepo: Repository<DeliveryLineItem>,
+    @InjectRepository(Grn)
+    private readonly grnRepo: Repository<Grn>,
+    @InjectRepository(GrnLineItem)
+    private readonly grnLineItemRepo: Repository<GrnLineItem>,
+    @InjectRepository(NotificationContact)
+    private readonly notifContactRepo: Repository<NotificationContact>,
+    private readonly whatsappService: WhatsappService,
+    private readonly validationService: ValidationService,
   ) {}
 
   async findAll(query: QueryPoDto): Promise<PurchaseOrder[]> {
-    const where: FindOptionsWhere<PurchaseOrder> = {};
+    const baseWhere: FindOptionsWhere<PurchaseOrder> = {};
 
-    if (query.status) where.status = query.status;
-    if (query.vendorId) where.vendorId = query.vendorId;
-    if (query.poNumber) where.poNumber = query.poNumber;
+    if (query.status) baseWhere.status = query.status;
+    if (query.vendorId) baseWhere.vendorId = query.vendorId;
+    if (query.poNumber) baseWhere.poNumber = query.poNumber;
     if (query.fromDate && query.toDate) {
-      where.poDate = Between(new Date(query.fromDate), new Date(query.toDate));
+      baseWhere.poDate = Between(new Date(query.fromDate), new Date(query.toDate));
+    }
+
+    const search = query.search?.trim();
+    let where: FindOptionsWhere<PurchaseOrder> | FindOptionsWhere<PurchaseOrder>[] = baseWhere;
+    if (search) {
+      const term = `%${search}%`;
+      // Match on PO number OR vendor (customer) name; both must respect the other base filters.
+      where = [
+        { ...baseWhere, poNumber: ILike(term) },
+        { ...baseWhere, vendor: { name: ILike(term) } },
+      ];
     }
 
     return this.poRepo.find({
@@ -60,10 +92,12 @@ export class PoService {
     return !!existing;
   }
 
-  /** Check for duplicate by email message ID */
+  /** Check for duplicate by email message ID (any common Message-ID formatting). */
   async isDuplicateEmail(emailMessageId: string): Promise<boolean> {
+    const variants = messageIdSearchVariants(emailMessageId);
+    if (!variants.length) return false;
     const existing = await this.poRepo.findOne({
-      where: { emailMessageId },
+      where: variants.map((emailMessageId) => ({ emailMessageId })),
     });
     return !!existing;
   }
@@ -83,6 +117,16 @@ export class PoService {
     lineItems?: ExtractedLineItem[];
     extractedData?: Record<string, unknown>;
   }): Promise<PurchaseOrder> {
+    // Defensive guard: if extraction accidentally returned our own company as
+    // the customer/vendor, fall back to a placeholder so we never persist
+    // ourselves as the buyer. This complements the per-extractor filters.
+    if (isOwnCompanyName(data.vendorName)) {
+      this.logger.warn(
+        `Vendor name "${data.vendorName}" matched our own company; saving as "Unknown Customer".`,
+      );
+      data.vendorName = 'Unknown Customer';
+    }
+
     // Resolve vendor by name (fuzzy) or code
     let vendor = await this.vendorRepo.findOne({
       where: { name: data.vendorName },
@@ -160,12 +204,163 @@ export class PoService {
       );
     }
 
-    return this.findById(savedPo.id);
+    // Auto-validate against pricing rules as soon as PO is created.
+    // Keep PO creation resilient even if validation fails.
+    try {
+      await this.validationService.validatePo(savedPo.id);
+    } catch (err) {
+      this.logger.error(
+        `Auto-validation failed for PO ${savedPo.poNumber}: ${(err as Error)?.message}`,
+      );
+    }
+
+    const fullPo = await this.findById(savedPo.id);
+    // Fire-and-forget — don't block PO creation on WhatsApp send
+    void this.sendPoWhatsAppNotification(fullPo);
+    return fullPo;
+  }
+
+  private async sendPoWhatsAppNotification(po: PurchaseOrder): Promise<void> {
+    try {
+      const contacts = await this.notifContactRepo.find({ where: { isActive: true } });
+      if (!contacts.length) return;
+
+      const dateStr = po.poDate
+        ? new Date(po.poDate).toLocaleDateString('en-IN')
+        : '';
+      const totalStr = po.totalAmount != null
+        ? `₹${Number(po.totalAmount).toLocaleString('en-IN')}`
+        : 'N/A';
+      const itemCount = (po.lineItems ?? []).length;
+
+      const message = [
+        `📦 *New PO Received*`,
+        `PO Number: ${po.poNumber}`,
+        `Vendor: ${(po as any).vendor?.name ?? 'N/A'}`,
+        `Date: ${dateStr}`,
+        `Items: ${itemCount}`,
+        `Total: ${totalStr}`,
+        po.shippingLocation ? `Ship To: ${po.shippingLocation}` : '',
+        po.expectedDeliveryDate
+          ? `Delivery By: ${new Date(po.expectedDeliveryDate).toLocaleDateString('en-IN')}`
+          : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
+      await Promise.all(
+        contacts.map((c) =>
+          this.whatsappService.sendMessage(c.phone, message).catch((err) => {
+            this.logger.warn(`WhatsApp notify failed for ${c.phone}: ${err?.message}`);
+          }),
+        ),
+      );
+    } catch (err) {
+      this.logger.warn(`WhatsApp PO notification error: ${(err as Error)?.message}`);
+    }
   }
 
   async updateStatus(id: string, status: PoStatus): Promise<PurchaseOrder> {
     const po = await this.findById(id);
     po.status = status;
     return this.poRepo.save(po);
+  }
+
+  async removeById(id: string): Promise<{ success: true; message: string; id: string }> {
+    const po = await this.poRepo.findOne({
+      where: { id },
+      relations: ['deliveries', 'grns'],
+    });
+
+    if (!po) {
+      throw new NotFoundException(`PO with id ${id} not found`);
+    }
+
+    // Cascade delete: GRN line items → GRNs → delivery line items → deliveries → PO line items → PO
+    const grnIds = (po.grns ?? []).map((g) => g.id);
+    if (grnIds.length > 0) {
+      await this.grnLineItemRepo.delete({ grnId: In(grnIds) });
+      await this.grnRepo.delete({ purchaseOrderId: id });
+    }
+
+    const deliveryIds = (po.deliveries ?? []).map((d) => d.id);
+    if (deliveryIds.length > 0) {
+      await this.deliveryLineItemRepo.delete({ deliveryId: In(deliveryIds) });
+      await this.deliveryRepo.delete({ purchaseOrderId: id });
+    }
+
+    await this.lineItemRepo.delete({ purchaseOrderId: id });
+    await this.poRepo.delete({ id });
+
+    return {
+      success: true,
+      message: 'PO deleted successfully',
+      id,
+    };
+  }
+
+  async flushTestingData(): Promise<{
+    success: true;
+    message: string;
+    deleted: {
+      deliveryLineItems: number;
+      deliveries: number;
+      grnLineItems: number;
+      grns: number;
+      poLineItems: number;
+      purchaseOrders: number;
+    };
+  }> {
+    const [deliveryLineItems, deliveries, grnLineItems, grns, poLineItems, purchaseOrders] = await Promise.all([
+      this.deliveryLineItemRepo.count(),
+      this.deliveryRepo.count(),
+      this.grnLineItemRepo.count(),
+      this.grnRepo.count(),
+      this.lineItemRepo.count(),
+      this.poRepo.count(),
+    ]);
+
+    await this.deliveryLineItemRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    await this.grnLineItemRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    await this.deliveryRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    await this.grnRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    await this.lineItemRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    await this.poRepo
+      .createQueryBuilder()
+      .delete()
+      .execute();
+
+    return {
+      success: true,
+      message: 'Flushed all PO-related testing data',
+      deleted: {
+        deliveryLineItems,
+        deliveries,
+        grnLineItems,
+        grns,
+        poLineItems,
+        purchaseOrders,
+      },
+    };
   }
 }

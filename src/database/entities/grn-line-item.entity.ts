@@ -12,12 +12,20 @@ export class GrnLineItem extends BaseEntity {
   @JoinColumn({ name: 'grn_id' })
   grn!: Grn;
 
-  @Column({ name: 'sku_id' })
-  skuId!: string;
+  @Column({ name: 'sku_id', nullable: true })
+  skuId?: string;
 
-  @ManyToOne(() => Sku)
+  @ManyToOne(() => Sku, { nullable: true })
   @JoinColumn({ name: 'sku_id' })
-  sku!: Sku;
+  sku?: Sku;
+
+  /** Item code from PO/delivery when no SKU match */
+  @Column({ name: 'item_code', nullable: true })
+  itemCode?: string;
+
+  /** Item name from PO/delivery when no SKU match */
+  @Column({ name: 'item_name', nullable: true })
+  itemName?: string;
 
   /** Quantity received as per GRN */
   @Column({ name: 'received_quantity', type: 'int' })

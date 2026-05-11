@@ -1,4 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AiPoExtractionService, AiPoExtractionResult } from './ai-po-extraction.service';
+import { OWN_COMPANY_PATTERNS } from './own-company';
 
 /** Extracted line item from a PO PDF/XLS */
 export interface ExtractedLineItem {
@@ -36,6 +38,8 @@ export interface PdfExtractionResult {
   grandTotal?: number;
   totalTax?: number;
   rawText?: string;
+  confidence?: number;
+  extractionMethod?: 'rule' | 'hybrid' | 'ai';
 }
 
 /**
@@ -45,6 +49,11 @@ export interface PdfExtractionResult {
 @Injectable()
 export class PdfExtractionService {
   private readonly logger = new Logger(PdfExtractionService.name);
+  private readonly ownCompanyPatterns = OWN_COMPANY_PATTERNS;
+
+  constructor(
+    private readonly aiPoExtractionService: AiPoExtractionService,
+  ) {}
 
   async extract(pdfBuffer: Buffer): Promise<PdfExtractionResult> {
     this.logger.log('Starting PDF extraction...');
@@ -66,20 +75,104 @@ export class PdfExtractionService {
     const format = this.detectFormat(text);
     this.logger.log(`Detected PDF format: ${format}`);
 
-    const result = format === 'hyperpure'
-      ? this.parseHyperpurePo(text)
-      : this.parseCloudstorePo(text);
+    let result: PdfExtractionResult;
+    if (format === 'hyperpure') {
+      result = this.parseHyperpurePo(text);
+    } else if (format === 'vendor_billing') {
+      result = this.parseVendorBillingPo(text);
+    } else if (format === 'moonstone') {
+      result = this.parseMoonstonePo(text);
+    } else {
+      result = this.parseCloudstorePo(text);
+    }
     result.rawText = text;
 
+    result.confidence = this.computeConfidence(result);
+    result.extractionMethod = 'rule';
+
+    // Hybrid fallback: if rule-based confidence is weak, try free-tier Gemini extraction.
+    if (this.shouldUseAiFallback(result)) {
+      this.logger.warn(
+        `Low extraction confidence (${result.confidence?.toFixed(2)}) for PO ${result.poNumber || '[unknown]'}, trying AI fallback`,
+      );
+      const aiResult = await this.aiPoExtractionService.extractFromText(text);
+      if (aiResult) {
+        result = this.mergeWithAiResult(result, aiResult);
+      }
+    }
+
     this.logger.log(
-      `Extracted PO ${result.poNumber} with ${result.lineItems.length} line items`,
+      `Extracted PO ${result.poNumber} with ${result.lineItems.length} line items (confidence=${result.confidence?.toFixed(2)}, method=${result.extractionMethod})`,
     );
     return result;
+  }
+
+  private shouldUseAiFallback(result: PdfExtractionResult): boolean {
+    if (!this.aiPoExtractionService.isEnabled()) return false;
+    if (!result.poNumber || !result.poDate || !result.vendorName) return true;
+    if (!result.shippingLocation) return true;
+    if (!result.lineItems || result.lineItems.length === 0) return true;
+    return (result.confidence || 0) < 0.72;
+  }
+
+  private computeConfidence(result: PdfExtractionResult): number {
+    let score = 0;
+    if (result.poNumber) score += 0.25;
+    if (result.poDate) score += 0.15;
+    if (result.vendorName) score += 0.15;
+    if (result.shippingLocation) score += 0.10;
+    if (result.lineItems?.length) {
+      score += result.lineItems.length >= 2 ? 0.25 : 0.15;
+    }
+    if (typeof result.grandTotal === 'number' && result.grandTotal > 0) score += 0.10;
+    return Math.min(1, score);
+  }
+
+  private mergeWithAiResult(
+    ruleResult: PdfExtractionResult,
+    aiResult: AiPoExtractionResult,
+  ): PdfExtractionResult {
+    const merged: PdfExtractionResult = {
+      ...ruleResult,
+      vendorName: ruleResult.vendorName || aiResult.vendorName || '',
+      vendorCode: ruleResult.vendorCode || aiResult.vendorCode,
+      vendorGstin: ruleResult.vendorGstin || aiResult.vendorGstin,
+      poNumber: ruleResult.poNumber || aiResult.poNumber || '',
+      poDate: ruleResult.poDate || aiResult.poDate || '',
+      expectedDeliveryDate: ruleResult.expectedDeliveryDate || aiResult.expectedDeliveryDate,
+      expiryDate: ruleResult.expiryDate || aiResult.expiryDate,
+      paymentTerms: ruleResult.paymentTerms || aiResult.paymentTerms,
+      shippingLocation: ruleResult.shippingLocation || aiResult.shippingLocation || '',
+      grandTotal: ruleResult.grandTotal ?? aiResult.grandTotal,
+      lineItems: ruleResult.lineItems?.length
+        ? ruleResult.lineItems
+        : (aiResult.lineItems || []).map((li) => ({
+            skuCode: li.skuCode,
+            skuName: li.skuName,
+            hsnCode: li.hsnCode,
+            quantity: li.quantity,
+            price: li.price,
+            mrp: li.mrp,
+            total: li.total,
+          })),
+      extractionMethod: 'hybrid',
+    };
+
+    merged.confidence = this.computeConfidence(merged);
+    return merged;
   }
 
   private detectFormat(text: string): string {
     if (/hyperpure/i.test(text) && /Purchase Order Number/i.test(text)) {
       return 'hyperpure';
+    }
+    if (/P\.?O\.?\s*Number/i.test(text) && /Shipping\s*Spoc\s*Details/i.test(text)) {
+      return 'moonstone';
+    }
+    // Format where left column = Vendor Details (our company) and right = PO Details,
+    // and the counterparty (buyer) appears in the Billing Address section.
+    if (/Vendor\s*Details/i.test(text) && /Billing\s*Address/i.test(text) && /PO\s*No/i.test(text)) {
+      return 'vendor_billing';
     }
     return 'cloudstore';
   }
@@ -103,16 +196,31 @@ export class PdfExtractionService {
     const poDate = getNextLineValue(/^Purchase Order Date$/i);
     const expectedDeliveryDate = getNextLineValue(/^Expected Delivery Date$/i);
 
-    // Vendor: "Bill From : VENDOR NAME"
-    const billFromMatch = text.match(/Bill From\s*:\s*(.+?)(?:\s*Shipped|$)/im);
-    const vendorName = billFromMatch ? billFromMatch[1].trim() : '';
+    // Customer = "Bill To" company — label and value are on separate lines:
+    // Line N:   "Bill To :       Shipped To :"
+    // Line N+1: "Zomato Hyperpure Pvt Ltd (CPC-MUM5)     Zomato Hyperpure Pvt Ltd ..."
+    let vendorName = '';
+    for (let i = 0; i < lines.length; i++) {
+      if (/Bill\s*To\s*:/i.test(lines[i])) {
+        // Next non-empty line has the company name; take the left-column part (before tab)
+        for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
+          const raw = lines[j].split('\t')[0].trim();
+          // Strip trailing location code like "(CPC-MUM5)"
+          const name = raw.replace(/\s*\([^)]+\)\s*$/, '').trim();
+          if (name && name.length > 2) { vendorName = name; break; }
+        }
+        break;
+      }
+    }
 
-    // GSTIN from Bill From section (first GSTIN in file)
-    const gstinMatch = text.match(/GSTIN\s*:\s*(\S+)/i);
+    // GSTIN from Bill To section (second GSTIN after Bill To)
+    const billToIdx = text.search(/Bill To\s*:/i);
+    const afterBillTo = billToIdx >= 0 ? text.substring(billToIdx) : text;
+    const gstinMatch = afterBillTo.match(/GSTIN\s*:\s*(\S+)/i);
     const vendorGstin = gstinMatch ? gstinMatch[1] : undefined;
 
-    // Vendor address
-    const vendorAddrMatch = text.match(/Bill From[\s\S]*?Address\s*:\s*([\s\S]*?)(?:GSTIN|Phone)/i);
+    // Vendor address (Bill To address)
+    const vendorAddrMatch = text.match(/Bill To[\s\S]*?Address\s*:\s*([\s\S]*?)(?:GSTIN|Phone|State)/i);
     const vendorAddress = vendorAddrMatch
       ? vendorAddrMatch[1].replace(/\n/g, ', ').replace(/\s+/g, ' ').trim()
       : undefined;
@@ -198,6 +306,210 @@ export class PdfExtractionService {
     return items;
   }
 
+  /**
+   * Parser for PO format where:
+   *   - "Vendor Details" = the user's own company (supplier) — we SKIP this
+   *   - "Billing Address" = the counterparty/buyer — this is our vendorName
+   */
+  private parseVendorBillingPo(text: string): PdfExtractionResult {
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+
+    const poNumber = this.extractField(lines, /PO\s*No\s*:\s*(\S+)/i) || '';
+    const poDate = this.extractField(lines, /PO\s*Date\s*:\s*(.+)/i) || '';
+    const expectedDeliveryDate = this.extractField(lines, /Expected\s*Delivery\s*Date\s*:\s*(.+)/i);
+    const expiryDate = this.extractField(lines, /PO\s*Expiry\s*Date\s*:\s*(.+)/i);
+    // Only keep paymentTerms if it looks like a short payment term (not T&C text)
+    const rawPaymentTerms = this.extractField(lines, /Payment\s*Terms\s*:\s*(.+)/i);
+    const paymentTerms = rawPaymentTerms && rawPaymentTerms.length <= 80 ? rawPaymentTerms : undefined;
+
+    // Extract the counterparty name from Billing Address section. If billing
+    // shows the seller (us) instead of the buyer, fall back to other candidates.
+    const vendorName = this.pickCounterpartyName(
+      this.extractBillingAddressCompany(text),
+      this.extractShippingAddressCompany(text),
+      this.extractVendorName(lines),
+    );
+
+    // GSTIN from Billing Address (second GSTIN after the Billing Address header)
+    const vendorGstin = this.extractBillingAddressGstin(text);
+
+    // Shipping location from the Shipping Address section
+    const shippingLocation = this.extractShippingLocationFromBillingFormat(text);
+
+    // Line items and totals — use dedicated extractor for this format (UUID-based SKU)
+    const lineItems = this.extractVendorBillingLineItems(text);
+
+    const grandTotalMatch = text.match(/Grand\s*Total\s*(?:Amount\s*)?\(INR\)\s*([\d,.]+)/i);
+    const grandTotal = grandTotalMatch
+      ? parseFloat(grandTotalMatch[1].replace(/,/g, ''))
+      : undefined;
+
+    const totalTaxMatch = text.match(/Total\s*Tax\s*\(INR\)\s*([\d,.]+)/i);
+    const totalTax = totalTaxMatch
+      ? parseFloat(totalTaxMatch[1].replace(/,/g, ''))
+      : undefined;
+
+    return {
+      vendorName,
+      vendorGstin,
+      poNumber,
+      poDate,
+      expectedDeliveryDate,
+      expiryDate,
+      paymentTerms,
+      shippingLocation,
+      lineItems,
+      grandTotal,
+      totalTax,
+    };
+  }
+
+  /**
+   * Extract line items from the vendor_billing PDF format.
+   * This format has: Sr | Material Code | Item Description | SKU Code (UUID) | HSN Code | EAN No | Qty | MRP | Unit Cost | Taxable Value | [taxes] | Total
+   */
+  private extractVendorBillingLineItems(text: string): ExtractedLineItem[] {
+    const items: ExtractedLineItem[] = [];
+    const lines = text.split('\n');
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      // Match lines starting with serial number + material code (5-6 digit numeric)
+      const startMatch = line.match(/^(\d+)\s+(\d{5,6})\s+(.+)/);
+      if (!startMatch) continue;
+
+      const materialCode = startMatch[2];
+      // Collect up to 15 continuation lines
+      let block = startMatch[3];
+      let j = i + 1;
+      while (j < lines.length && j < i + 15) {
+        const next = lines[j].trim();
+        if (/^\d+\s+\d{5,6}\s+/.test(next)) break; // next serial number row
+        block += ' ' + next;
+        j++;
+      }
+
+      // Normalize: UUIDs may be split across lines with a space at the hyphen boundary.
+      // e.g. "dbbe1122-2957-44c4- bcd1-dad32ad193ad" → remove spaces after/before UUID segments
+      block = block.replace(/([0-9a-f]{4,8}-)\s+([0-9a-f])/gi, '$1$2');
+
+      // Now match the full UUID
+      const uuidPattern = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+      const uuidMatch = block.match(uuidPattern);
+      if (!uuidMatch) continue;
+
+      const afterUuid = block.substring(block.indexOf(uuidMatch[0]) + uuidMatch[0].length).trim();
+      // After UUID: HSN(8) EAN(12-13) Qty MRP UnitCost TaxableValue ... Total
+      const numMatch = afterUuid.match(
+        /(\d{8})\s+(\d{12,13})\s+(\d+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/,
+      );
+      if (!numMatch) continue;
+
+      // Description is everything before the UUID
+      const desc = block
+        .substring(0, block.indexOf(uuidMatch[0]))
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      // Total: last number in afterUuid
+      const allNums = afterUuid.match(/[\d.]+/g) || [];
+      const total = allNums.length > 0 ? parseFloat(allNums[allNums.length - 1]) : undefined;
+
+      items.push({
+        skuCode: materialCode,
+        skuName: desc,
+        hsnCode: numMatch[1],
+        quantity: parseInt(numMatch[3], 10),
+        mrp: parseFloat(numMatch[4]),
+        price: parseFloat(numMatch[5]),
+        taxableValue: parseFloat(numMatch[6]),
+        total,
+      });
+    }
+
+    return items;
+  }
+
+  /** Extract the first company name from the Billing Address block */
+  private extractBillingAddressCompany(text: string): string {
+    // Text after "Billing Address" up to the next major section
+    const billingMatch = text.match(/Billing\s*Address[\s\S]*?Address\s*:\s*([^\n]+)/i);
+    if (billingMatch) {
+      // First line of the address is typically the company name
+      const firstLine = billingMatch[1].trim();
+      if (firstLine && firstLine.length > 2) return firstLine;
+    }
+    // Fallback: look for a line right after "Billing Address" header
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      if (/Billing\s*Address/i.test(lines[i])) {
+        for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
+          const line = lines[j];
+          if (
+            line &&
+            !/^Address\s*:/i.test(line) &&
+            !/^GSTIN\s*:/i.test(line) &&
+            !/^PAN\s*:/i.test(line) &&
+            !/^Shipping\s*Address/i.test(line) &&
+            line.length > 4
+          ) {
+            return line;
+          }
+        }
+      }
+    }
+    return '';
+  }
+
+  /** Extract GSTIN from the Billing Address section (not the Vendor Details section) */
+  private extractBillingAddressGstin(text: string): string | undefined {
+    // Find the section after "Billing Address"
+    const billingIdx = text.search(/Billing\s*Address/i);
+    if (billingIdx === -1) return undefined;
+    const afterBilling = text.substring(billingIdx);
+    const gstinMatch = afterBilling.match(/GSTIN\s*:\s*(\S+)/i);
+    return gstinMatch ? gstinMatch[1] : undefined;
+  }
+
+  /** Extract the company / counterparty name from the Shipping Address section. */
+  private extractShippingAddressCompany(text: string): string {
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      if (/Shipping\s*Address/i.test(lines[i])) {
+        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
+          const line = lines[j];
+          if (
+            line &&
+            !/^Address\s*:/i.test(line) &&
+            !/^GSTIN\s*:/i.test(line) &&
+            !/^PAN\s*:/i.test(line) &&
+            !/^Phone\s*:/i.test(line) &&
+            !/^State\s*:/i.test(line) &&
+            !/^Billing\s*Address/i.test(line) &&
+            line.length > 4
+          ) {
+            return line;
+          }
+        }
+      }
+    }
+    return '';
+  }
+
+  /** Extract shipping location from Shipping Address section in vendor_billing format */
+  private extractShippingLocationFromBillingFormat(text: string): string {
+    const shippingIdx = text.search(/Shipping\s*Address/i);
+    if (shippingIdx === -1) return '';
+    const afterShipping = text.substring(shippingIdx);
+    // Look for a warehouse/location code in parentheses e.g. (HYD003M)
+    const codeMatch = afterShipping.match(/\(([A-Z0-9]+)\)/i);
+    if (codeMatch) return codeMatch[1];
+    // Fallback: first company-like line after "Address:"
+    const addrMatch = afterShipping.match(/Address\s*:\s*([^\n]+)/i);
+    if (addrMatch) return addrMatch[1].trim();
+    return '';
+  }
+
   private parseCloudstorePo(text: string): PdfExtractionResult {
     const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
 
@@ -216,8 +528,10 @@ export class PdfExtractionService {
       /Payment\s*Terms\s*:\s*(.+)/i,
     );
 
-    // Vendor name is typically before the address block, after "Reference PO Code"
-    const vendorName = this.extractVendorName(lines);
+    const vendorName = this.pickCounterpartyName(
+      this.extractBillingAddressCompany(text),
+      this.extractVendorName(lines),
+    );
     const vendorGstin = this.extractField(lines, /GSTIN\s*:(\S+)/i);
 
     // Shipping location from the shipping address block
@@ -254,6 +568,190 @@ export class PdfExtractionService {
       grandTotal,
       totalTax,
     };
+  }
+
+  /**
+   * Parser for Moonstone-style PO format (sample "Purchase Order.pdf") where labels are:
+   * - P.O. Number
+   * - Date
+   * - PO delivery date / PO expiry date
+   * and line items are wrapped heavily across lines.
+   */
+  private parseMoonstonePo(text: string): PdfExtractionResult {
+    const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+
+    const poNumber =
+      this.extractField(lines, /P\.?O\.?\s*Number\s*:\s*(\S+)/i) ||
+      this.extractField(lines, /PO\s*No\s*:\s*(\S+)/i) ||
+      '';
+
+    const poDate =
+      this.extractField(lines, /^Date\s*:\s*(.+)$/i) ||
+      this.extractField(lines, /PO\s*Date\s*:\s*(.+)/i) ||
+      '';
+
+    const expectedDeliveryDate =
+      this.extractField(lines, /PO\s*delivery\s*date\s*:\s*(.+)/i) ||
+      this.extractField(lines, /Expected\s*Delivery\s*Date\s*:\s*(.+)/i);
+
+    const expiryDate =
+      this.extractField(lines, /PO\s*expiry\s*date\s*:\s*(.+)/i) ||
+      this.extractField(lines, /PO\s*Expiry\s*Date\s*:\s*(.+)/i);
+
+    const paymentTerms = this.extractField(lines, /Payment\s*Terms\s*:\s*(.+)/i);
+
+    const vendorName = this.extractMoonstoneCounterpartyName(text, lines);
+
+    const vendorGstin =
+      this.extractField(lines, /GST\s*No\.?\s*:\s*(\S+)/i) ||
+      this.extractField(lines, /GSTIN\s*:\s*(\S+)/i);
+
+    const shippingLocation = this.extractMoonstoneShippingLocation(text);
+
+    const lineItems = this.extractMoonstoneLineItems(text);
+
+    const grandTotalMatch =
+      text.match(/Net\s*amount\s*([\d,.]+)/i) ||
+      text.match(/Total\s*Amount\s*([\d,.]+)/i);
+    const grandTotal = grandTotalMatch
+      ? parseFloat(grandTotalMatch[1].replace(/,/g, ''))
+      : undefined;
+
+    return {
+      vendorName,
+      vendorGstin,
+      poNumber,
+      poDate,
+      expectedDeliveryDate,
+      expiryDate,
+      paymentTerms,
+      shippingLocation,
+      lineItems,
+      grandTotal,
+    };
+  }
+
+  private isOwnCompanyName(name?: string): boolean {
+    if (!name) return false;
+    return this.ownCompanyPatterns.some((p) => p.test(name));
+  }
+
+  private pickCounterpartyName(...candidates: Array<string | undefined>): string {
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const c = candidate.trim();
+      if (!c) continue;
+      if (!this.isOwnCompanyName(c)) return c;
+    }
+    return candidates.find((c) => !!c && c.trim().length > 0)?.trim() || '';
+  }
+
+  private extractMoonstoneCounterpartyName(text: string, lines: string[]): string {
+    const headerCandidates: string[] = [];
+
+    // In Moonstone PO, the issuer is usually in the top block before PAN/CIN labels.
+    for (const line of lines.slice(0, 40)) {
+      if (!line) continue;
+      if (/^purchase\s*order$/i.test(line)) continue;
+      if (/^(pan|cin|contact|phone|address|vendor|delivered|shipping|payment|p\.?o\.?\s*number|date)\b/i.test(line)) {
+        continue;
+      }
+      if (/\b(llp|pvt\.?\s*ltd|private\s+limited|ltd|limited|inc|corp|ventures)\b/i.test(line)) {
+        headerCandidates.push(line);
+      }
+    }
+
+    const explicitVendor =
+      this.extractField(lines, /Vendor\s*:\s*(.+)/i) ||
+      this.extractVendorName(lines);
+
+    return this.pickCounterpartyName(
+      ...headerCandidates,
+      explicitVendor,
+      this.extractBillingAddressCompany(text),
+    );
+  }
+
+  private extractMoonstoneShippingLocation(text: string): string {
+    // Prefer city+pincode chunks from shipping section (e.g. Hyderabad 500094)
+    const cityPinMatches = text.match(/[A-Za-z]+\s+\d{6}/g);
+    if (cityPinMatches && cityPinMatches.length > 0) {
+      return cityPinMatches[cityPinMatches.length - 1];
+    }
+    return '';
+  }
+
+  private extractMoonstoneLineItems(text: string): ExtractedLineItem[] {
+    const items: ExtractedLineItem[] = [];
+    const lines = text.split('\n').map((l) => l.trim());
+
+    const startIdx = lines.findIndex((l) => /^#\s*Item/i.test(l));
+    if (startIdx === -1) return items;
+
+    const isRowStart = (line: string) => /^\d{1,3}\s+\d{5,8}/.test(line);
+
+    for (let i = startIdx + 1; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line) continue;
+      if (/^Total\s*Quantity/i.test(line)) break;
+      if (!isRowStart(line)) continue;
+
+      const startMatch = line.match(/^(\d{1,3})\s+(\d{5,8})(.*)$/);
+      if (!startMatch) continue;
+
+      let block = `${startMatch[2]} ${startMatch[3] || ''}`.trim();
+      let j = i + 1;
+      while (j < lines.length) {
+        const next = lines[j];
+        if (!next) {
+          j++;
+          continue;
+        }
+        if (isRowStart(next) || /^Total\s*Quantity/i.test(next)) break;
+        block += ` ${next}`;
+        j++;
+      }
+      i = j - 1;
+
+      block = block.replace(/\s+/g, ' ').trim();
+
+      // Head: item code fragments + HSN (often split as 0407 1100)
+      const headMatch = block.match(/^(\d{5,8})(?:\s+(\d{1,3}))?\s+(\d{4})\s*(\d{4})\s+([\s\S]+)$/);
+      if (!headMatch) continue;
+
+      const itemCode = `${headMatch[1]}${headMatch[2] || ''}`;
+      const hsnCode = `${headMatch[3]}${headMatch[4]}`;
+      let tail = headMatch[5].trim();
+
+      // Strip UPC-ish leading numeric chunks before description.
+      tail = tail.replace(/^(?:\d{4,13}\s+){1,4}/, '');
+
+      const firstDecimalIdx = tail.search(/\d+\.\d{1,2}/);
+      if (firstDecimalIdx === -1) continue;
+
+      const skuName = tail.substring(0, firstDecimalIdx).replace(/\s+/g, ' ').trim();
+      const numPart = tail.substring(firstDecimalIdx);
+      const nums = (numPart.match(/\d+\.\d{1,2}|\d+/g) || []).map((n) => parseFloat(n));
+      if (nums.length < 4) continue;
+
+      // In this format, tail usually ends with: Qty, MRP, Margin%, Total
+      const quantity = nums.length >= 4 ? nums[nums.length - 4] : 0;
+      const mrp = nums.length >= 3 ? nums[nums.length - 3] : undefined;
+      const total = nums.length >= 1 ? nums[nums.length - 1] : undefined;
+      const price = nums[0]; // Basic cost price
+
+      items.push({
+        skuCode: itemCode,
+        skuName,
+        hsnCode,
+        quantity,
+        price,
+        mrp,
+        total,
+      });
+    }
+
+    return items;
   }
 
   private extractField(
@@ -312,45 +810,65 @@ export class PdfExtractionService {
 
   private extractLineItems(text: string): ExtractedLineItem[] {
     const items: ExtractedLineItem[] = [];
+    const lines = text.split('\n');
 
-    // Find the line items section between the table header and "Total Amount"
-    // In the Cloudstore PDF, line items are between "Total (INR)" (last header) and "Total Amount (INR)"
-    const sectionMatch = text.match(
-      /Amt\s*\(INR\)\s*([\s\S]*?)(?:\d[\d,.]+\s+\d[\d,.]+\s+\d[\d,.]+\s+\d[\d,.]+\s+\d[\d,.]+\s+\d[\d,.]+\s+[\d,.]+\n\s*Total\s*Amount)/i,
-    );
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      // Match a line starting with a serial number followed by a 4-6 digit item code
+      const startMatch = line.match(/^(\d+)\s+(\d{4,6})\s+(.*)/);
+      if (!startMatch) continue;
 
-    const section = sectionMatch ? sectionMatch[1] : text;
+      const serialNo = parseInt(startMatch[1], 10);
+      const itemCode = startMatch[2];
+      if (serialNo < 1 || serialNo > 999) continue;
 
-    // Look for pattern: serial_number item_code description hsn_code qty mrp unit_cost taxable_value ...taxes... total
-    // In the Cloudstore PDF text, each line item spans multiple lines and ends with
-    // HSN code followed by numeric values on the same line
-    const lineItemPattern =
-      /(\d+)\s+(\d{4,6})\s+([\s\S]*?)(\d{8})\s+([\d]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/g;
+      // Strip colour/size/brand metadata from the description part first
+      const rawDesc = startMatch[3].replace(/\s*Colour:.*$/i, '').trim();
 
-    let match: RegExpExecArray | null;
-    while ((match = lineItemPattern.exec(section)) !== null) {
-      // Clean description
-      const desc = match[3]
-        .replace(/\n/g, ' ')
-        .replace(/\s+/g, ' ')
-        .replace(/\s*Colour:.*$/i, '')
-        .trim();
+      // Collect continuation lines until the next item or a totals row
+      let block = rawDesc;
+      let j = i + 1;
+      while (j < lines.length && j < i + 20) {
+        const next = lines[j].trim();
+        if (/^\d+\s+\d{4,6}\s+/.test(next)) break; // next item row
+        if (/Total\s*Amount|Grand\s*Total/i.test(next)) break;
+        // Strip colour metadata from continuation lines too
+        const cleaned = next.replace(/\s*Colour:.*$/i, '').trim();
+        block += ' ' + cleaned;
+        j++;
+      }
+
+      block = block.replace(/\s+/g, ' ').trim();
+
+      // Find 8-digit HSN code
+      const hsnMatch = block.match(/\b(\d{8})\b/);
+      if (!hsnMatch) continue;
+
+      const hsnIdx = block.indexOf(hsnMatch[0]);
+      const desc = block.substring(0, hsnIdx).replace(/\s+/g, ' ').trim();
+      const afterHsn = block.substring(hsnIdx + 8).trim();
+
+      // Parse numbers after HSN: Qty, MRP, UnitCost, TaxableValue, ...taxes..., Total
+      const nums = afterHsn.match(/[\d,]+\.?\d*/g);
+      if (!nums || nums.length < 4) continue;
+
+      const parseNum = (s: string) => parseFloat(s.replace(/,/g, ''));
 
       items.push({
-        skuCode: match[2],
+        skuCode: itemCode,
         skuName: desc,
-        hsnCode: match[4],
-        quantity: parseInt(match[5], 10),
-        mrp: parseFloat(match[6]),
-        price: parseFloat(match[7]),
-        taxableValue: parseFloat(match[8]),
-        cgstRate: parseFloat(match[9]),
-        cgstAmount: parseFloat(match[10]),
-        sgstRate: parseFloat(match[11]),
-        sgstAmount: parseFloat(match[12]),
-        igstRate: parseFloat(match[13]),
-        igstAmount: parseFloat(match[14]),
-        total: parseFloat(match[18]),
+        hsnCode: hsnMatch[0],
+        quantity: parseNum(nums[0]),
+        mrp: parseNum(nums[1]),
+        price: parseNum(nums[2]),
+        taxableValue: parseNum(nums[3]),
+        cgstRate: nums[4] ? parseNum(nums[4]) : undefined,
+        cgstAmount: nums[5] ? parseNum(nums[5]) : undefined,
+        sgstRate: nums[6] ? parseNum(nums[6]) : undefined,
+        sgstAmount: nums[7] ? parseNum(nums[7]) : undefined,
+        igstRate: nums[8] ? parseNum(nums[8]) : undefined,
+        igstAmount: nums[9] ? parseNum(nums[9]) : undefined,
+        total: nums.length > 0 ? parseNum(nums[nums.length - 1]) : undefined,
       });
     }
 

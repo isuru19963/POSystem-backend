@@ -1,6 +1,6 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, LessThanOrEqual, MoreThanOrEqual, IsNull, Or } from 'typeorm';
+import { Repository, LessThanOrEqual, MoreThanOrEqual, IsNull, Or, FindOptionsWhere } from 'typeorm';
 import {
   VendorPricingRule,
   PricingRuleType,
@@ -38,22 +38,21 @@ export class PricingService {
     sku: Sku,
     poDate: Date,
     city: string,
+    poShippingLocation?: string,
   ): Promise<CalculatedPrice> {
-    // Find the active pricing rule for this vendor + brand
-    const rule = await this.ruleRepo.findOne({
-      where: {
-        vendorId,
-        brand: sku.brand,
-        isActive: true,
-        effectiveFrom: LessThanOrEqual(poDate),
-        effectiveTo: Or(MoreThanOrEqual(poDate), IsNull()),
-      },
-      order: { effectiveFrom: 'DESC' },
-    });
+    const baseWhere = {
+      vendorId,
+      brand: sku.brand,
+      isActive: true,
+      effectiveFrom: LessThanOrEqual(poDate),
+      effectiveTo: Or(MoreThanOrEqual(poDate), IsNull()),
+    };
+
+    const rule = await this.findApplicableRule(baseWhere, sku.packSize, poShippingLocation);
 
     if (!rule) {
       throw new NotFoundException(
-        `No active pricing rule found for vendor ${vendorId}, brand ${sku.brand}`,
+        `No active pricing rule found for vendor ${vendorId}, brand ${sku.brand}, pack size ${sku.packSize}`,
       );
     }
 
@@ -61,10 +60,53 @@ export class PricingService {
       case PricingRuleType.PREMIUM_FRESH:
         return this.calculatePremiumFresh(rule, sku, poDate, city);
       case PricingRuleType.DR_GOOD_EGGS:
+      case PricingRuleType.PURE_O_FRESH:
         return this.calculateDrGoodEggs(rule, sku);
       default:
         throw new Error(`Unsupported pricing rule type: ${rule.type}`);
     }
+  }
+
+  /**
+   * Prefer pack-size + shipping-location-specific rules, then fall back to broader rules.
+   * Rules with shipping_location set only match POs with the same ship-to; rules with null
+   * shipping_location apply to any PO (for that pack-size tier).
+   */
+  private async findApplicableRule(
+    baseWhere: {
+      vendorId: string;
+      brand: string;
+      isActive: boolean;
+      effectiveFrom: ReturnType<typeof LessThanOrEqual>;
+      effectiveTo: ReturnType<typeof Or>;
+    },
+    packSize: number,
+    poShippingLocation?: string,
+  ): Promise<VendorPricingRule | null> {
+    const ship = poShippingLocation?.trim();
+
+    const tryOne = async (ps: number | ReturnType<typeof IsNull>, loc: string | ReturnType<typeof IsNull>) =>
+      this.ruleRepo.findOne({
+        where: { ...baseWhere, packSize: ps as any, shippingLocation: loc as any } as FindOptionsWhere<VendorPricingRule>,
+        order: { effectiveFrom: 'DESC' },
+      });
+
+    const attempts: Array<[number | ReturnType<typeof IsNull>, string | ReturnType<typeof IsNull>]> = [];
+    if (ship) {
+      attempts.push([packSize, ship]);
+      attempts.push([packSize, IsNull()]);
+      attempts.push([IsNull() as any, ship]);
+      attempts.push([IsNull() as any, IsNull()]);
+    } else {
+      attempts.push([packSize, IsNull()]);
+      attempts.push([IsNull() as any, IsNull()]);
+    }
+
+    for (const [ps, loc] of attempts) {
+      const found = await tryOne(ps, loc);
+      if (found) return found;
+    }
+    return null;
   }
 
   /**
@@ -81,13 +123,15 @@ export class PricingService {
     previousDay.setDate(previousDay.getDate() - 1);
 
     const neccCity = rule.neccCity || city;
+    // Use the closest available rate on or before the required date (handles weekends/holidays/missing data)
     const neccPrice = await this.neccPriceRepo.findOne({
-      where: { city: neccCity, date: previousDay },
+      where: { city: neccCity, date: LessThanOrEqual(previousDay) },
+      order: { date: 'DESC' },
     });
 
     if (!neccPrice) {
       throw new NotFoundException(
-        `NECC price not found for city ${neccCity} on ${previousDay.toISOString().split('T')[0]}`,
+        `No NECC price found for city ${neccCity} on or before ${previousDay.toISOString().split('T')[0]}`,
       );
     }
 
@@ -145,5 +189,19 @@ export class PricingService {
   async createRule(data: Partial<VendorPricingRule>): Promise<VendorPricingRule> {
     const rule = this.ruleRepo.create(data);
     return this.ruleRepo.save(rule);
+  }
+
+  async updateRule(id: string, data: Partial<VendorPricingRule>): Promise<VendorPricingRule> {
+    const { vendor, ...updateData } = data as any;
+    await this.ruleRepo.update(id, updateData);
+    const updated = await this.ruleRepo.findOne({ where: { id }, relations: ['vendor'] });
+    if (!updated) throw new NotFoundException(`Pricing rule ${id} not found`);
+    return updated;
+  }
+
+  async deleteRule(id: string): Promise<void> {
+    const rule = await this.ruleRepo.findOne({ where: { id } });
+    if (!rule) throw new NotFoundException(`Pricing rule ${id} not found`);
+    await this.ruleRepo.remove(rule);
   }
 }

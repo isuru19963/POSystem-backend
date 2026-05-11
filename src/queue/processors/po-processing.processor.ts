@@ -8,11 +8,25 @@ import {
   EmailAttachment,
 } from '../../email/imap.service';
 import { StorageService } from '../../storage/storage.service';
+import { WhatsappService } from '../../whatsapp/whatsapp.service';
 import { PoService } from '../../modules/po/services/po.service';
 import { PdfExtractionService } from '../../modules/po/services/pdf-extraction.service';
 import { XlsExtractionService } from '../../modules/po/services/xls-extraction.service';
 import { PdfExtractionResult } from '../../modules/po/services/pdf-extraction.service';
+import { GrnService } from '../../modules/grn/services/grn.service';
+import { isGrnInboundEmail, pickPrimaryGrnPdf } from '../../email/grn-email.util';
 import { v4 as uuidv4 } from 'uuid';
+
+/** Summary returned by the `monitor-inbox` job so controllers can surface progress. */
+export interface MonitorInboxSummary {
+  imapHits: number;
+  emailsWithDocs: number;
+  poCreated: number;
+  grnCreated: number;
+  skippedDuplicates: number;
+  errors: string[];
+  durationMs: number;
+}
 
 @Processor(QUEUE_NAMES.PO_PROCESSING)
 export class PoProcessingProcessor extends WorkerHost {
@@ -21,28 +35,30 @@ export class PoProcessingProcessor extends WorkerHost {
   constructor(
     private readonly imapService: ImapService,
     private readonly storageService: StorageService,
+    private readonly whatsappService: WhatsappService,
     private readonly poService: PoService,
     private readonly pdfExtractionService: PdfExtractionService,
     private readonly xlsExtractionService: XlsExtractionService,
+    private readonly grnService: GrnService,
   ) {
     super();
   }
 
-  async process(job: Job): Promise<void> {
+  async process(job: Job): Promise<unknown> {
     this.logger.log(`Processing job ${job.name} (${job.id})`);
 
     switch (job.name) {
       case 'monitor-inbox':
-        await this.monitorInbox();
-        break;
+        return await this.monitorInbox();
       case 'reprocess-all':
         await this.reprocessAll();
-        break;
+        return;
       case 'process-po-email':
         await this.processPoEmail(job.data);
-        break;
+        return;
       default:
         this.logger.warn(`Unknown job name: ${job.name}`);
+        return;
     }
   }
 
@@ -52,7 +68,7 @@ export class PoProcessingProcessor extends WorkerHost {
   private async reprocessAll(): Promise<void> {
     this.logger.log('Reprocessing ALL emails in inbox...');
     try {
-      const emails = await this.imapService.fetchAllEmails();
+      const { emails } = await this.imapService.fetchAllEmails();
       this.logger.log(`Found ${emails.length} emails to reprocess`);
 
       for (const email of emails) {
@@ -71,37 +87,111 @@ export class PoProcessingProcessor extends WorkerHost {
   }
 
   /**
-   * Monitor IMAP inbox for new PO emails
-   * Downloads PDF/XLS attachments, uploads to S3, extracts data, and creates PO records
+   * Monitor IMAP inbox for new PO/GRN emails.
+   * Downloads PDF/XLS attachments, uploads to S3, extracts data, and creates PO/GRN records.
+   * Returns a summary so HTTP callers (via `getJob().returnvalue`) can show progress.
    */
-  private async monitorInbox(): Promise<void> {
+  private async monitorInbox(): Promise<MonitorInboxSummary> {
     this.logger.log('Monitoring inbox for new PO emails...');
-    try {
-      const emails = await this.imapService.fetchUnreadEmails();
+    const startedAt = Date.now();
+    const summary: MonitorInboxSummary = {
+      imapHits: 0,
+      emailsWithDocs: 0,
+      poCreated: 0,
+      grnCreated: 0,
+      skippedDuplicates: 0,
+      errors: [],
+      durationMs: 0,
+    };
 
-      for (const email of emails) {
+    try {
+      const fetched = await this.imapService.fetchUnreadPlusRecentMerged(21);
+      summary.imapHits = fetched.imapMatchCount;
+      summary.emailsWithDocs = fetched.emails.length;
+      this.logger.log(
+        `Monitoring merged inbox: ${fetched.emails.length} unique messages with doc attachments`,
+      );
+
+      for (const email of fetched.emails) {
         try {
-          await this.processEmail(email);
+          const outcome = await this.processEmail(email);
+          if (outcome === 'po') summary.poCreated++;
+          else if (outcome === 'grn') summary.grnCreated++;
+          else if (outcome === 'duplicate') summary.skippedDuplicates++;
         } catch (error) {
-          this.logger.error(
-            `Failed to process email ${email.messageId}: ${error}`,
-          );
+          const msg = `Failed to process email ${email.messageId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`;
+          this.logger.error(msg);
+          summary.errors.push(msg);
         }
       }
     } catch (error) {
       this.logger.error(`IMAP inbox monitoring failed: ${error}`);
       throw error;
     }
+
+    summary.durationMs = Date.now() - startedAt;
+    this.logger.log(
+      `Inbox monitor done in ${summary.durationMs}ms: +${summary.poCreated} PO, +${summary.grnCreated} GRN, ${summary.skippedDuplicates} dup, ${summary.errors.length} errors`,
+    );
+    return summary;
   }
 
-  private async processEmail(email: IncomingEmail): Promise<void> {
-    // Skip if we've already processed this email
+  /** Returns the kind of record that was created (or null if nothing was created). */
+  private async processEmail(
+    email: IncomingEmail,
+  ): Promise<'po' | 'grn' | 'duplicate' | null> {
+    // GRN emails: subject/filename signals, PO number comes from the PDF
+    if (isGrnInboundEmail(email.subject, email.attachments)) {
+      const grnPdf = pickPrimaryGrnPdf(email.subject, email.attachments);
+      if (!grnPdf) {
+        this.logger.warn(`GRN-like email has no PDF attachment: ${email.subject}`);
+        return null;
+      }
+      if (email.messageId) {
+        const existing = await this.grnService.findByEmailMessageId(email.messageId);
+        if (existing) {
+          this.logger.log(`Skipping duplicate GRN email: ${email.messageId}`);
+          return 'duplicate';
+        }
+      }
+      const batchId = uuidv4();
+      const grnKey = `grn-files/${batchId}/${grnPdf.filename}`;
+      await this.storageService.uploadFile(grnKey, grnPdf.content, grnPdf.contentType);
+      try {
+        const grn = await this.grnService.createFromEmailPdf({
+          emailMessageId: email.messageId,
+          rawFileKey: grnKey,
+          pdfBuffer: grnPdf.content,
+        });
+        if (grn) {
+          this.logger.log(`Created GRN ${grn.grnNumber} from email "${email.subject}"`);
+          try {
+            await this.whatsappService.sendGroupAlert(
+              `📋 *GRN from email*\nGRN#: ${grn.grnNumber}\nFile: ${grnPdf.filename}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+            );
+          } catch (waErr) {
+            this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);
+          }
+          return 'grn';
+        }
+      } catch (err) {
+        this.logger.error(
+          `GRN email processing failed (${email.subject}): ${err instanceof Error ? err.message : err}`,
+        );
+        throw err;
+      }
+      return null;
+    }
+
+    // Skip if we've already processed this email as a PO
     if (
       email.messageId &&
       (await this.poService.isDuplicateEmail(email.messageId))
     ) {
       this.logger.log(`Skipping duplicate email: ${email.messageId}`);
-      return;
+      return 'duplicate';
     }
 
     // Extract PO number from email subject/body or filename
@@ -110,7 +200,7 @@ export class PoProcessingProcessor extends WorkerHost {
       this.logger.warn(
         `Could not extract PO number from email: ${email.subject}`,
       );
-      return;
+      return null;
     }
 
     // Separate attachments by type
@@ -174,7 +264,7 @@ export class PoProcessingProcessor extends WorkerHost {
         extracted = await this.pdfExtractionService.extract(pdfAttachment.content);
       } else {
         this.logger.warn('No usable attachment found');
-        return;
+        return null;
       }
     } catch (extractionError) {
       this.logger.error(`Extraction failed: ${extractionError}`);
@@ -200,8 +290,35 @@ export class PoProcessingProcessor extends WorkerHost {
     // Parse dates safely
     const parseDate = (dateStr?: string): Date | undefined => {
       if (!dateStr) return undefined;
-      const d = new Date(dateStr);
-      return isNaN(d.getTime()) ? undefined : d;
+
+      const raw = String(dateStr).trim();
+      if (!raw || /^0+$/.test(raw)) return undefined;
+
+      if (/^\d{10,13}$/.test(raw)) {
+        const n = Number(raw);
+        const ms = raw.length === 10 ? n * 1000 : n;
+        const tsDate = new Date(ms);
+        if (!isNaN(tsDate.getTime()) && tsDate.getUTCFullYear() >= 2000) {
+          return tsDate;
+        }
+        return undefined;
+      }
+
+      const dmy = raw.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/);
+      if (dmy) {
+        const [, d, m, y] = dmy;
+        const iso = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+        const parsed = new Date(iso);
+        if (!isNaN(parsed.getTime()) && parsed.getUTCFullYear() >= 2000) {
+          return parsed;
+        }
+        return undefined;
+      }
+
+      const normalized = raw.replace(/\b([ap])\.?m\.?\b/gi, '$1m');
+      const parsed = new Date(normalized);
+      if (isNaN(parsed.getTime()) || parsed.getUTCFullYear() < 2000) return undefined;
+      return parsed;
     };
 
     // Create PO record with line items
@@ -227,9 +344,24 @@ export class PoProcessingProcessor extends WorkerHost {
       } as unknown as Record<string, unknown>,
     });
 
+    const finalPoNumber = extracted.poNumber || poNumber;
     this.logger.log(
-      `Created PO ${extracted.poNumber || poNumber} with ${extracted.lineItems.length} line items from email`,
+      `Created PO ${finalPoNumber} with ${extracted.lineItems.length} line items from email`,
     );
+
+    // Notify via WhatsApp
+    try {
+      const vendorDisplay = extracted.vendorName || 'Unknown vendor';
+      const itemCount = extracted.lineItems.length;
+      const location = extracted.shippingLocation || 'unknown location';
+      await this.whatsappService.sendGroupAlert(
+        `📦 *New PO Received*\nPO#: ${finalPoNumber}\nVendor: ${vendorDisplay}\nItems: ${itemCount}\nShip to: ${location}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+      );
+    } catch (waErr) {
+      this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);
+    }
+
+    return 'po';
   }
 
   /**

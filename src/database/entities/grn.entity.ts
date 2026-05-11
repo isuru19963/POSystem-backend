@@ -35,6 +35,9 @@ export class Grn extends BaseEntity {
   @Column({ name: 'email_message_id', nullable: true, unique: true })
   emailMessageId?: string;
 
+  @Column({ type: 'text', nullable: true })
+  notes?: string;
+
   /** 3-way match result: PO vs Delivered vs GRN */
   @Column({ name: 'match_result', type: 'jsonb', nullable: true })
   matchResult?: Record<string, unknown>;

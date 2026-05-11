@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, Between, In } from 'typeorm';
 import {
   PurchaseOrder,
   PoStatus,
@@ -24,11 +24,19 @@ export class ConsolidationService {
    * Calculate total packs, total eggs, and required crates
    */
   async consolidate(date: Date): Promise<Consolidation[]> {
-    this.logger.log(`Running consolidation for ${date.toISOString().split('T')[0]}`);
+    const dateStr = date.toISOString().split('T')[0];
+    this.logger.log(`Running consolidation for ${dateStr}`);
+
+    // Use date range to reliably match the `date` column regardless of timezone
+    const startOfDay = new Date(`${dateStr}T00:00:00.000Z`);
+    const endOfDay = new Date(`${dateStr}T23:59:59.999Z`);
 
     // Get all validated POs for this date
     const pos = await this.poRepo.find({
-      where: { poDate: date, status: PoStatus.VALIDATED },
+      where: {
+        poDate: Between(startOfDay, endOfDay) as any,
+        status: PoStatus.VALIDATED,
+      },
       relations: ['lineItems', 'lineItems.sku'],
     });
 
@@ -86,34 +94,50 @@ export class ConsolidationService {
       const totalEggs = items.reduce((sum, i) => sum + i.totalEggs, 0);
       const totalCrates = items.reduce((sum, i) => sum + i.requiredCrates, 0);
 
-      const consolidation = this.consolidationRepo.create({
-        consolidationDate: date,
-        city,
-        items,
-        totalPacks,
-        totalEggs,
-        totalCrates,
-        poIds,
+      // Upsert: update existing consolidation for this date+city, or create new
+      let consolidation = await this.consolidationRepo.findOne({
+        where: { consolidationDate: startOfDay as any, city },
       });
+
+      if (consolidation) {
+        consolidation.items = items;
+        consolidation.totalPacks = totalPacks;
+        consolidation.totalEggs = totalEggs;
+        consolidation.totalCrates = totalCrates;
+        consolidation.poIds = poIds;
+      } else {
+        consolidation = this.consolidationRepo.create({
+          consolidationDate: date,
+          city,
+          items,
+          totalPacks,
+          totalEggs,
+          totalCrates,
+          poIds,
+        });
+      }
 
       consolidations.push(await this.consolidationRepo.save(consolidation));
 
-      // Update PO statuses
+      // Fix: use In() operator to update multiple POs by ID
       await this.poRepo.update(
-        poIds.map((id) => id),
+        { id: In(poIds) },
         { status: PoStatus.CONSOLIDATED },
       );
     }
 
     this.logger.log(
-      `Created ${consolidations.length} consolidations for ${pos.length} POs`,
+      `Upserted ${consolidations.length} consolidations for ${pos.length} POs`,
     );
     return consolidations;
   }
 
   async findByDate(date: Date): Promise<Consolidation[]> {
+    const dateStr = date.toISOString().split('T')[0];
+    const startOfDay = new Date(`${dateStr}T00:00:00.000Z`);
+    const endOfDay = new Date(`${dateStr}T23:59:59.999Z`);
     return this.consolidationRepo.find({
-      where: { consolidationDate: date },
+      where: { consolidationDate: Between(startOfDay, endOfDay) as any },
       order: { city: 'ASC' },
     });
   }

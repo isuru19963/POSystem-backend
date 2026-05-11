@@ -6,12 +6,21 @@ import {
   PurchaseOrderLineItem,
   Vendor,
   Sku,
+  Delivery,
+  DeliveryLineItem,
+  Grn,
+  GrnLineItem,
 } from '../../database/entities';
 import { PoController } from './controllers/po.controller';
 import { PoService } from './services/po.service';
 import { PdfExtractionService } from './services/pdf-extraction.service';
 import { XlsExtractionService } from './services/xls-extraction.service';
+import { AiPoExtractionService } from './services/ai-po-extraction.service';
 import { QUEUE_NAMES } from '../../common/constants/app.constants';
+import { EmailModule } from '../../email/email.module';
+import { WhatsappModule } from '../../whatsapp/whatsapp.module';
+import { ValidationModule } from '../validation/validation.module';
+import { NotificationContact } from '../../database/entities';
 
 @Module({
   imports: [
@@ -20,11 +29,19 @@ import { QUEUE_NAMES } from '../../common/constants/app.constants';
       PurchaseOrderLineItem,
       Vendor,
       Sku,
+      Delivery,
+      DeliveryLineItem,
+      Grn,
+      GrnLineItem,
+      NotificationContact,
     ]),
     BullModule.registerQueue({ name: QUEUE_NAMES.PO_PROCESSING }),
+    EmailModule,
+    WhatsappModule,
+    ValidationModule,
   ],
   controllers: [PoController],
-  providers: [PoService, PdfExtractionService, XlsExtractionService],
-  exports: [PoService, PdfExtractionService, XlsExtractionService],
+  providers: [PoService, PdfExtractionService, XlsExtractionService, AiPoExtractionService],
+  exports: [PoService, PdfExtractionService, XlsExtractionService, AiPoExtractionService],
 })
 export class PoModule {}

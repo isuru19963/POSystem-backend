@@ -1,4 +1,5 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Get, Query, Res } from '@nestjs/common';
+import type { Response } from 'express';
 import { ReportsService } from '../services/reports.service';
 
 @Controller('reports')
@@ -54,5 +55,91 @@ export class ReportsController {
   @Get('dispatch-summary')
   dispatchSummary(@Query('date') date: string) {
     return this.reportsService.getDispatchSummary(new Date(date));
+  }
+
+  // ---- CSV exports ----
+
+  @Get('export/vendor-performance')
+  async exportVendorPerformance(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getVendorPerformance(
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data, `vendor-performance_${from}_${to}.csv`);
+  }
+
+  @Get('export/city-sku-analytics')
+  async exportCitySkuAnalytics(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getCitySkuAnalytics(
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data, `city-sku-analytics_${from}_${to}.csv`);
+  }
+
+  @Get('export/fulfillment-rates')
+  async exportFulfillmentRates(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getFulfillmentRates(
+      new Date(from),
+      new Date(to),
+    );
+    // getFulfillmentRates returns a single object — wrap in array for CSV
+    this.sendCsv(res, [data], `fulfillment-rates_${from}_${to}.csv`);
+  }
+
+  @Get('export/necc-trends')
+  async exportNeccTrends(
+    @Query('city') city: string,
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getNeccTrends(
+      city,
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data as unknown as Record<string, unknown>[], `necc-trends_${city}_${from}_${to}.csv`);
+  }
+
+  // ---- helpers ----
+
+  private sendCsv(
+    res: Response,
+    rows: Record<string, unknown>[],
+    filename: string,
+  ) {
+    if (!rows || rows.length === 0) {
+      res.setHeader('Content-Type', 'text/csv');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      return res.send('');
+    }
+    const headers = Object.keys(rows[0]);
+    const escape = (v: unknown) => {
+      const s = v == null ? '' : String(v);
+      return s.includes(',') || s.includes('"') || s.includes('\n')
+        ? `"${s.replace(/"/g, '""')}"`
+        : s;
+    };
+    const csv = [
+      headers.join(','),
+      ...rows.map((row) => headers.map((h) => escape(row[h])).join(',')),
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send('\uFEFF' + csv); // BOM for Excel UTF-8 compatibility
   }
 }

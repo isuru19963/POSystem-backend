@@ -1,0 +1,9 @@
+# Exclude but keep dist/ so EB runs the pre-built app
+node_modules/
+.env
+.env.*
+uploads/
+coverage/
+.nyc_output/
+*.log
+.DS_Store

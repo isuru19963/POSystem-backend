@@ -39,6 +39,9 @@ export class Delivery extends BaseEntity {
   @Column({ name: 'dispatch_date', type: 'date' })
   dispatchDate!: Date;
 
+  @Column({ name: 'actual_delivery_date', type: 'timestamp', nullable: true })
+  actualDeliveryDate?: Date;
+
   @Column({ type: 'enum', enum: DispatchStatus, default: DispatchStatus.PLANNED })
   status!: DispatchStatus;
 

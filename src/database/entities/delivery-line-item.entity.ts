@@ -12,12 +12,20 @@ export class DeliveryLineItem extends BaseEntity {
   @JoinColumn({ name: 'delivery_id' })
   delivery!: Delivery;
 
-  @Column({ name: 'sku_id' })
-  skuId!: string;
+  @Column({ name: 'sku_id', nullable: true })
+  skuId?: string;
 
-  @ManyToOne(() => Sku)
+  @ManyToOne(() => Sku, { nullable: true })
   @JoinColumn({ name: 'sku_id' })
-  sku!: Sku;
+  sku?: Sku;
+
+  /** Fallback item code when no SKU is linked */
+  @Column({ name: 'item_code', nullable: true })
+  itemCode?: string;
+
+  /** Fallback item name when no SKU is linked */
+  @Column({ name: 'item_name', nullable: true })
+  itemName?: string;
 
   /** Quantity ordered (from PO) */
   @Column({ name: 'ordered_quantity', type: 'int' })

@@ -2,12 +2,17 @@ import {
   Controller,
   Get,
   Post,
+  Delete,
+  HttpCode,
+  HttpStatus,
+  NotFoundException,
   Param,
   Query,
   ParseUUIDPipe,
   UseInterceptors,
   UploadedFile,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectQueue } from '@nestjs/bullmq';
@@ -17,9 +22,54 @@ import { PdfExtractionService } from '../services/pdf-extraction.service';
 import { XlsExtractionService } from '../services/xls-extraction.service';
 import { QueryPoDto } from '../dto/query-po.dto';
 import { QUEUE_NAMES } from '../../../common/constants/app.constants';
+import { enqueueInboxMonitor } from '../../../queue/inbox-monitor.helpers';
+
+/**
+ * Parse a date string that may be in dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy or ISO formats.
+ * Returns undefined when the string is empty or unparseable.
+ */
+function parsePoDate(dateStr?: string): Date | undefined {
+  if (!dateStr) return undefined;
+
+  const raw = String(dateStr).trim();
+  if (!raw || /^0+$/.test(raw)) return undefined;
+
+  // Unix timestamp support (seconds or milliseconds).
+  if (/^\d{10,13}$/.test(raw)) {
+    const n = Number(raw);
+    const ms = raw.length === 10 ? n * 1000 : n;
+    const tsDate = new Date(ms);
+    if (!isNaN(tsDate.getTime()) && tsDate.getUTCFullYear() >= 2000) {
+      return tsDate;
+    }
+    return undefined;
+  }
+
+  // dd/mm/yyyy  dd-mm-yyyy  dd.mm.yyyy
+  const dmy = raw.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})$/);
+  if (dmy) {
+    const [, d, m, y] = dmy;
+    const iso = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+    const date = new Date(iso);
+    if (!isNaN(date.getTime()) && date.getUTCFullYear() >= 2000) {
+      return date;
+    }
+    return undefined;
+  }
+
+  // Normalize meridiem variations like "p.m." -> "pm".
+  const normalized = raw.replace(/\b([ap])\.?m\.?\b/gi, '$1m');
+
+  // yyyy-mm-dd or any other natively parseable format
+  const date = new Date(normalized);
+  if (isNaN(date.getTime()) || date.getUTCFullYear() < 2000) return undefined;
+  return date;
+}
 
 @Controller('po')
 export class PoController {
+  private readonly logger = new Logger(PoController.name);
+
   constructor(
     private readonly poService: PoService,
     private readonly pdfExtractionService: PdfExtractionService,
@@ -36,6 +86,20 @@ export class PoController {
   @Get(':id')
   findById(@Param('id', ParseUUIDPipe) id: string) {
     return this.poService.findById(id);
+  }
+
+  /** Flush all PO and PO-linked records (testing use only). */
+  @Post('flush-testing')
+  @HttpCode(HttpStatus.OK)
+  flushTestingData() {
+    return this.poService.flushTestingData();
+  }
+
+  /** Delete PO (testing use only). Fails if PO is linked to dispatch/GRN records. */
+  @Delete(':id')
+  @HttpCode(HttpStatus.OK)
+  removeById(@Param('id', ParseUUIDPipe) id: string) {
+    return this.poService.removeById(id);
   }
 
   @Post('reprocess-all')
@@ -88,11 +152,7 @@ export class PoController {
       );
     }
 
-    const parseDate = (dateStr?: string): Date | undefined => {
-      if (!dateStr) return undefined;
-      const d = new Date(dateStr);
-      return isNaN(d.getTime()) ? undefined : d;
-    };
+    const parseDate = parsePoDate;
 
     return this.poService.createFromEmail({
       poNumber: extracted.poNumber,
@@ -107,5 +167,51 @@ export class PoController {
       lineItems: extracted.lineItems,
       extractedData: extracted as unknown as Record<string, unknown>,
     });
+  }
+
+  /**
+   * Enqueue an inbox monitor job (handles both PO and GRN emails) and return
+   * its id immediately. IMAP + PDF/XLS extraction routinely takes longer than
+   * any reverse-proxy timeout, so the actual work happens in the BullMQ worker
+   * and the client polls `GET /po/fetch-from-email/status/:jobId` for results.
+   *
+   * If a monitor-inbox job is already in flight (cron or another manual
+   * click), we return its id instead of stacking a duplicate.
+   */
+  @Post('fetch-from-email')
+  async fetchFromEmail() {
+    const { jobId, alreadyPending } = await enqueueInboxMonitor(
+      this.poProcessingQueue,
+      this.logger,
+    );
+    this.logger.log(
+      alreadyPending
+        ? `Reusing in-flight inbox monitor job ${jobId}`
+        : `Queued inbox monitor job ${jobId}`,
+    );
+    return {
+      jobId,
+      status: alreadyPending ? 'in-progress' : 'queued',
+    };
+  }
+
+  /** Poll the status of a previously-queued inbox monitor job. */
+  @Get('fetch-from-email/status/:jobId')
+  async fetchFromEmailStatus(@Param('jobId') jobId: string) {
+    const job = await this.poProcessingQueue.getJob(jobId);
+    if (!job) {
+      throw new NotFoundException(
+        `Job ${jobId} not found — it may have completed and been cleaned up.`,
+      );
+    }
+    const state = await job.getState();
+    return {
+      jobId,
+      state, // 'waiting' | 'active' | 'completed' | 'failed' | 'delayed' | …
+      result: job.returnvalue ?? null,
+      failedReason: job.failedReason ?? null,
+      processedOn: job.processedOn ?? null,
+      finishedOn: job.finishedOn ?? null,
+    };
   }
 }

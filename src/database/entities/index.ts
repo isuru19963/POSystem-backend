@@ -1,6 +1,8 @@
 export { BaseEntity } from './base.entity';
 export { Vendor } from './vendor.entity';
 export { Sku } from './sku.entity';
+export { Vehicle } from './vehicle.entity';
+export { Driver } from './driver.entity';
 export { PurchaseOrder, PoStatus } from './purchase-order.entity';
 export { PurchaseOrderLineItem, LineItemValidationStatus } from './purchase-order-line-item.entity';
 export { VendorPricingRule, PricingRuleType } from './vendor-pricing-rule.entity';
@@ -16,3 +18,7 @@ export { User, UserRole } from './user.entity';
 export { AuditLog } from './audit-log.entity';
 export { Consolidation } from './consolidation.entity';
 export { TatConfig } from './tat-config.entity';
+export { BlinkitProduct } from './blinkit-product.entity';
+export { BlinkitScrapeSession, ScrapeStatus } from './blinkit-scrape-session.entity';
+export { BlinkitPromotion } from './blinkit-promotion.entity';
+export { NotificationContact } from './notification-contact.entity';

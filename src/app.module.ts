@@ -26,6 +26,8 @@ import {
   Delivery,
   DeliveryLineItem,
   Route,
+  Vehicle,
+  Driver,
   Grn,
   GrnLineItem,
   Alert,
@@ -33,6 +35,10 @@ import {
   AuditLog,
   Consolidation,
   TatConfig,
+  BlinkitProduct,
+  BlinkitPromotion,
+  BlinkitScrapeSession,
+  NotificationContact,
 } from './database/entities';
 
 // Shared Modules
@@ -53,6 +59,7 @@ import { AdminModule } from './modules/admin/admin.module';
 import { TatModule } from './modules/tat/tat.module';
 import { ReportsModule } from './modules/reports/reports.module';
 import { AuthModule } from './modules/auth/auth.module';
+import { BlinkitModule } from './modules/blinkit/blinkit.module';
 
 // Queue
 import { QueueModule } from './queue/queue.module';
@@ -93,6 +100,8 @@ import { QueueModule } from './queue/queue.module';
           Delivery,
           DeliveryLineItem,
           Route,
+          Vehicle,
+          Driver,
           Grn,
           GrnLineItem,
           Alert,
@@ -100,9 +109,19 @@ import { QueueModule } from './queue/queue.module';
           AuditLog,
           Consolidation,
           TatConfig,
+          BlinkitProduct,
+          BlinkitPromotion,
+          BlinkitScrapeSession,
+          NotificationContact,
         ],
-        synchronize: process.env.NODE_ENV !== 'production',
+        synchronize: false,
+        migrations: [__dirname + '/database/migrations/**/*.{ts,js}'],
+        migrationsRun: true,
         logging: process.env.NODE_ENV === 'development',
+        ssl:
+          process.env.NODE_ENV === 'production'
+            ? { rejectUnauthorized: false }
+            : false,
       }),
       inject: [ConfigService],
     }),
@@ -140,6 +159,7 @@ import { QueueModule } from './queue/queue.module';
     AdminModule,
     TatModule,
     ReportsModule,
+    BlinkitModule,
 
     // Queue Workers
     QueueModule,
