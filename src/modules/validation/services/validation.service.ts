@@ -1,6 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { IsNull, Repository } from 'typeorm';
 import {
   PurchaseOrder,
   PurchaseOrderLineItem,
@@ -33,7 +33,7 @@ export interface ValidationResult {
 }
 
 @Injectable()
-export class ValidationService {
+export class ValidationService implements OnModuleInit {
   private readonly logger = new Logger(ValidationService.name);
 
   constructor(
@@ -55,6 +55,54 @@ export class ValidationService {
     private readonly alertsService: AlertsService,
     private readonly emailService: EmailService,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    try {
+      await this.backfillDeliveryDispatchDates();
+    } catch (err) {
+      this.logger.warn(
+        `Delivery dispatchDate backfill failed: ${
+          err instanceof Error ? err.message : err
+        }`,
+      );
+    }
+  }
+
+  /**
+   * One-shot startup backfill: earlier auto-created Delivery rows used the PO
+   * creation date as `dispatchDate`, ignoring the PDF's "Expected Delivery
+   * Date". Realign any PLANNED delivery (i.e. not yet physically dispatched)
+   * whose dispatchDate differs from its PO's expectedDeliveryDate.
+   */
+  private async backfillDeliveryDispatchDates(): Promise<void> {
+    const candidates = await this.deliveryRepo.find({
+      where: {
+        status: DispatchStatus.PLANNED,
+        actualDeliveryDate: IsNull(),
+      },
+      relations: ['purchaseOrder'],
+    });
+    let updated = 0;
+    for (const delivery of candidates) {
+      const po = delivery.purchaseOrder;
+      if (!po?.expectedDeliveryDate) continue;
+      const expected = new Date(po.expectedDeliveryDate);
+      expected.setHours(0, 0, 0, 0);
+      const current = delivery.dispatchDate
+        ? new Date(delivery.dispatchDate)
+        : null;
+      if (current) current.setHours(0, 0, 0, 0);
+      if (current && current.getTime() === expected.getTime()) continue;
+      delivery.dispatchDate = expected;
+      await this.deliveryRepo.save(delivery);
+      updated++;
+    }
+    if (updated > 0) {
+      this.logger.log(
+        `Backfilled dispatchDate from PO.expectedDeliveryDate on ${updated} delivery row(s)`,
+      );
+    }
+  }
 
   /**
    * Validate all line items in a PO against calculated prices
@@ -212,6 +260,16 @@ export class ValidationService {
   private async autoConsolidateAndDispatch(po: PurchaseOrder): Promise<void> {
     const poDate = new Date(po.poDate);
     poDate.setHours(0, 0, 0, 0);
+    // The Delivery's `dispatchDate` is what the UI labels "Delivery Date". Use the
+    // PO's expectedDeliveryDate when present; only fall back to poDate when the
+    // PDF didn't carry an explicit delivery date.
+    const dispatchDate = po.expectedDeliveryDate
+      ? (() => {
+          const d = new Date(po.expectedDeliveryDate as Date);
+          d.setHours(0, 0, 0, 0);
+          return d;
+        })()
+      : poDate;
 
     // --- 1. CONSOLIDATION ---
     // Find or create consolidation for this date+city
@@ -324,7 +382,7 @@ export class ValidationService {
       const delivery = this.deliveryRepo.create({
         purchaseOrderId: po.id,
         routeId: route?.id || undefined,
-        dispatchDate: poDate,
+        dispatchDate,
         status: DispatchStatus.PLANNED,
         lineItems: deliveryLineItems,
       });
