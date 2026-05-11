@@ -10,8 +10,11 @@ import { CreateGrnDto } from '../dto/create-grn.dto';
 import { CreateGrnManualDto } from '../dto/create-grn-manual.dto';
 import { UpdateGrnStatusDto } from '../dto/update-grn-status.dto';
 import { UpdateGrnNotesDto } from '../dto/update-grn-notes.dto';
-import { QUEUE_NAMES } from '../../../common/constants/app.constants';
-import { enqueueInboxMonitor } from '../../../queue/inbox-monitor.helpers';
+import {
+  JOB_NAMES,
+  QUEUE_NAMES,
+} from '../../../common/constants/app.constants';
+import { enqueueManualInboxFetch } from '../../../queue/inbox-monitor.helpers';
 
 @Controller('grn')
 export class GrnController {
@@ -34,24 +37,21 @@ export class GrnController {
   }
 
   /**
-   * Enqueue an inbox monitor job and return its id immediately. The BullMQ
-   * worker picks up both PO and GRN messages off the same IMAP scan, so this
-   * endpoint shares the queue with `POST /po/fetch-from-email`. Clients poll
-   * `GET /grn/fetch-from-email/status/:jobId` for the final summary.
-   *
-   * If a monitor-inbox job is already in flight, we return its id instead of
-   * stacking a duplicate.
+   * Enqueue a GRN-only inbox job (separate from PO manual fetch). Uses the same
+   * IMAP lookback as PO manual (14 days + UNSEEN) but only processes GRN-shaped
+   * messages. Poll `GET /grn/fetch-from-email/status/:jobId` for the summary.
    */
   @Post('fetch-from-email')
   async fetchFromEmail() {
-    const { jobId, alreadyPending } = await enqueueInboxMonitor(
+    const { jobId, alreadyPending } = await enqueueManualInboxFetch(
       this.poProcessingQueue,
+      JOB_NAMES.MONITOR_INBOX_GRN,
       this.logger,
     );
     this.logger.log(
       alreadyPending
-        ? `Reusing in-flight inbox monitor job ${jobId}`
-        : `Queued inbox monitor job ${jobId}`,
+        ? `Reusing in-flight GRN inbox job ${jobId}`
+        : `Queued GRN inbox job ${jobId}`,
     );
     return {
       jobId,

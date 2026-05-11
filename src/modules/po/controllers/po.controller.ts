@@ -21,8 +21,11 @@ import { PoService } from '../services/po.service';
 import { PdfExtractionService } from '../services/pdf-extraction.service';
 import { XlsExtractionService } from '../services/xls-extraction.service';
 import { QueryPoDto } from '../dto/query-po.dto';
-import { QUEUE_NAMES } from '../../../common/constants/app.constants';
-import { enqueueInboxMonitor } from '../../../queue/inbox-monitor.helpers';
+import {
+  JOB_NAMES,
+  QUEUE_NAMES,
+} from '../../../common/constants/app.constants';
+import { enqueueManualInboxFetch } from '../../../queue/inbox-monitor.helpers';
 
 /**
  * Parse a date string that may be in dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy or ISO formats.
@@ -170,24 +173,21 @@ export class PoController {
   }
 
   /**
-   * Enqueue an inbox monitor job (handles both PO and GRN emails) and return
-   * its id immediately. IMAP + PDF/XLS extraction routinely takes longer than
-   * any reverse-proxy timeout, so the actual work happens in the BullMQ worker
-   * and the client polls `GET /po/fetch-from-email/status/:jobId` for results.
-   *
-   * If a monitor-inbox job is already in flight (cron or another manual
-   * click), we return its id instead of stacking a duplicate.
+   * Enqueue a PO-only inbox job (separate from GRN manual fetch and from the
+   * cron full scan). Uses UNSEEN + last 14 days for a faster demo-friendly run.
+   * Poll `GET /po/fetch-from-email/status/:jobId` for the summary.
    */
   @Post('fetch-from-email')
   async fetchFromEmail() {
-    const { jobId, alreadyPending } = await enqueueInboxMonitor(
+    const { jobId, alreadyPending } = await enqueueManualInboxFetch(
       this.poProcessingQueue,
+      JOB_NAMES.MONITOR_INBOX_PO,
       this.logger,
     );
     this.logger.log(
       alreadyPending
-        ? `Reusing in-flight inbox monitor job ${jobId}`
-        : `Queued inbox monitor job ${jobId}`,
+        ? `Reusing in-flight PO inbox job ${jobId}`
+        : `Queued PO inbox job ${jobId}`,
     );
     return {
       jobId,

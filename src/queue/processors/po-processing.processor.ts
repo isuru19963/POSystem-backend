@@ -1,7 +1,7 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { Job } from 'bullmq';
-import { QUEUE_NAMES } from '../../common/constants/app.constants';
+import { JOB_NAMES, QUEUE_NAMES } from '../../common/constants/app.constants';
 import {
   ImapService,
   IncomingEmail,
@@ -17,7 +17,7 @@ import { GrnService } from '../../modules/grn/services/grn.service';
 import { isGrnInboundEmail, pickPrimaryGrnPdf } from '../../email/grn-email.util';
 import { v4 as uuidv4 } from 'uuid';
 
-/** Summary returned by the `monitor-inbox` job so controllers can surface progress. */
+/** Summary returned by inbox monitor jobs so controllers can surface progress. */
 export interface MonitorInboxSummary {
   imapHits: number;
   emailsWithDocs: number;
@@ -59,8 +59,12 @@ export class PoProcessingProcessor extends WorkerHost {
     this.logger.log(`Processing job ${job.name} (${job.id})`);
 
     switch (job.name) {
-      case 'monitor-inbox':
-        return await this.monitorInbox();
+      case JOB_NAMES.MONITOR_INBOX:
+        return await this.monitorInboxFull();
+      case JOB_NAMES.MONITOR_INBOX_PO:
+        return await this.monitorInboxManual('po');
+      case JOB_NAMES.MONITOR_INBOX_GRN:
+        return await this.monitorInboxManual('grn');
       case 'reprocess-all':
         await this.reprocessAll();
         return;
@@ -97,13 +101,32 @@ export class PoProcessingProcessor extends WorkerHost {
     }
   }
 
+  private async monitorInboxFull(): Promise<MonitorInboxSummary> {
+    this.logger.log('Monitoring inbox for new PO/GRN emails (full scan, 21 days)...');
+    return this.runInboxMonitor('full', 21);
+  }
+
   /**
-   * Monitor IMAP inbox for new PO/GRN emails.
-   * Downloads PDF/XLS attachments, uploads to S3, extracts data, and creates PO/GRN records.
-   * Returns a summary so HTTP callers (via `getJob().returnvalue`) can show progress.
+   * Manual button: only PO or only GRN, with a short IMAP lookback so demos
+   * finish in a reasonable time and the two buttons never share one job id.
    */
-  private async monitorInbox(): Promise<MonitorInboxSummary> {
-    this.logger.log('Monitoring inbox for new PO emails...');
+  private async monitorInboxManual(
+    mode: 'po' | 'grn',
+  ): Promise<MonitorInboxSummary> {
+    const sinceDays = 14;
+    const label = mode === 'po' ? 'PO (manual)' : 'GRN (manual)';
+    this.logger.log(
+      `${label}: scanning UNSEEN + last ${sinceDays} days (GRN-like mail ${
+        mode === 'po' ? 'skipped' : 'only'
+      })`,
+    );
+    return this.runInboxMonitor(mode, sinceDays);
+  }
+
+  private async runInboxMonitor(
+    mode: 'full' | 'po' | 'grn',
+    sinceDays: number,
+  ): Promise<MonitorInboxSummary> {
     const startedAt = Date.now();
     const summary: MonitorInboxSummary = {
       imapHits: 0,
@@ -116,14 +139,20 @@ export class PoProcessingProcessor extends WorkerHost {
     };
 
     try {
-      const fetched = await this.imapService.fetchUnreadPlusRecentMerged(21);
+      const fetched = await this.imapService.fetchUnreadPlusRecentMerged(sinceDays);
       summary.imapHits = fetched.imapMatchCount;
-      summary.emailsWithDocs = fetched.emails.length;
+      const candidates = fetched.emails.filter((email) => {
+        const grnLike = isGrnInboundEmail(email.subject, email.attachments);
+        if (mode === 'po' && grnLike) return false;
+        if (mode === 'grn' && !grnLike) return false;
+        return true;
+      });
+      summary.emailsWithDocs = candidates.length;
       this.logger.log(
-        `Monitoring merged inbox: ${fetched.emails.length} unique messages with doc attachments`,
+        `Inbox scan (${mode}, ${sinceDays}d): ${fetched.emails.length} doc-mails → ${candidates.length} to process`,
       );
 
-      for (const email of fetched.emails) {
+      for (const email of candidates) {
         try {
           const outcome = await this.processEmail(email);
           if (outcome === 'po') summary.poCreated++;
@@ -144,7 +173,7 @@ export class PoProcessingProcessor extends WorkerHost {
 
     summary.durationMs = Date.now() - startedAt;
     this.logger.log(
-      `Inbox monitor done in ${summary.durationMs}ms: +${summary.poCreated} PO, +${summary.grnCreated} GRN, ${summary.skippedDuplicates} dup, ${summary.errors.length} errors`,
+      `Inbox monitor (${mode}) done in ${summary.durationMs}ms: +${summary.poCreated} PO, +${summary.grnCreated} GRN, ${summary.skippedDuplicates} dup, ${summary.errors.length} errors`,
     );
     return summary;
   }

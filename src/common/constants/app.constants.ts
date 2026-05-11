@@ -20,5 +20,9 @@ export const JOB_NAMES = {
   SEND_ALERT: 'send-alert',
   FETCH_NECC_RATES: 'fetch-necc-rates',
   MONITOR_INBOX: 'monitor-inbox',
+  /** Manual "Fetch PO from email" — separate queue slot from GRN + faster IMAP window */
+  MONITOR_INBOX_PO: 'monitor-inbox-po',
+  /** Manual "Fetch GRN from email" — separate queue slot from PO + faster IMAP window */
+  MONITOR_INBOX_GRN: 'monitor-inbox-grn',
   PROCESS_GRN: 'process-grn',
 } as const;
