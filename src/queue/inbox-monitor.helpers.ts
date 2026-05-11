@@ -42,21 +42,65 @@ export async function enqueueInboxMonitor(
  * Drop redundant `monitor-inbox` jobs that accumulated while the worker was
  * stuck on a slow IMAP fetch. Keeps the single oldest waiting job so the
  * worker still has something to process when it comes back online.
+ *
+ * Also evicts any `active` monitor-inbox jobs left over from a previous process
+ * — those are necessarily orphaned (the process that held their lock is gone),
+ * and waiting for BullMQ's stalled detection (every `stalledInterval`) before
+ * the next run would block the user for 10+ minutes after every restart.
  */
 export async function drainDuplicateInboxJobs(
   queue: Queue,
   logger: Logger,
 ): Promise<number> {
-  const waiting: Job[] = await queue.getWaiting(0, 500);
+  const [waiting, active] = await Promise.all([
+    queue.getWaiting(0, 500),
+    queue.getActive(0, 500),
+  ]);
+
+  const monitorActive = active.filter(
+    (j) => j.name === JOB_NAMES.MONITOR_INBOX,
+  );
+  if (monitorActive.length > 0) {
+    // Any active monitor-inbox job at startup is by definition orphaned: the
+    // worker that held its lock is gone. The lock is still in Redis though,
+    // which blocks `job.remove()` and `moveToFailed` until BullMQ's stalled
+    // scanner (`stalledInterval`) finally notices — that's a 10-minute UX gap
+    // after every restart. Drop the lock keys directly so we can fail the job
+    // immediately.
+    const client = await queue.client;
+    const prefix = queue.opts.prefix ?? 'bull';
+    for (const job of monitorActive) {
+      try {
+        await client.del(`${prefix}:${queue.name}:${job.id}:lock`);
+        await job.moveToFailed(
+          new Error(
+            'Worker restarted while job was active — discarding orphan.',
+          ),
+          '0',
+          false,
+        );
+        logger.warn(
+          `Evicted orphaned active monitor-inbox job ${job.id} on startup`,
+        );
+      } catch (err) {
+        logger.warn(
+          `Failed to evict active monitor-inbox job ${job.id}: ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+      }
+    }
+  }
+
   const monitorWaiting = waiting.filter(
     (j) => j.name === JOB_NAMES.MONITOR_INBOX,
   );
-  if (monitorWaiting.length <= 1) return 0;
+  if (monitorWaiting.length <= 1) return monitorActive.length;
 
   const toRemove = monitorWaiting.slice(1);
   logger.warn(
     `Draining ${toRemove.length} duplicate monitor-inbox jobs from queue (keeping oldest)`,
   );
   await Promise.all(toRemove.map((j) => j.remove()));
-  return toRemove.length;
+  return toRemove.length + monitorActive.length;
 }

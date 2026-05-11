@@ -28,6 +28,38 @@ export interface ImapFetchOutcome {
   recentImapHits?: number;
 }
 
+/**
+ * Wrap a promise that has no native timeout (e.g. `imap-simple` callbacks) so a
+ * stuck IMAP server can't pin a BullMQ worker indefinitely. On timeout we
+ * reject; callers should `connection.end()` to free the socket.
+ */
+function withTimeout<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms} ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
+
+const IMAP_CONNECT_TIMEOUT_MS = 60_000; // 1 min — TCP + IMAP LOGIN
+const IMAP_SEARCH_TIMEOUT_MS = 4 * 60_000; // 4 min — broad SINCE scans on slow servers
+const IMAP_PARSE_TIMEOUT_MS = 5 * 60_000; // 5 min — body+attachment fetches over many msgs
+
 /** Supported PO attachment types */
 const PO_ATTACHMENT_TYPES = [
   'application/pdf',
@@ -61,26 +93,61 @@ export class ImapService {
     };
   }
 
+  /**
+   * Close an IMAP connection without throwing — safe to call from `finally`
+   * blocks after a timeout, where the socket may already be torn down.
+   */
+  private safeEnd(connection: imapSimple.ImapSimple | undefined): void {
+    if (!connection) return;
+    try {
+      connection.end();
+    } catch (err) {
+      this.logger.debug(
+        `Ignoring IMAP end() error: ${err instanceof Error ? err.message : err}`,
+      );
+    }
+  }
+
+  private async connectWithTimeout(): Promise<imapSimple.ImapSimple> {
+    return withTimeout(
+      imapSimple.connect(this.getConfig()),
+      IMAP_CONNECT_TIMEOUT_MS,
+      'IMAP connect',
+    );
+  }
+
   async fetchUnreadEmails(): Promise<ImapFetchOutcome> {
     this.logger.log('Connecting to IMAP server...');
-    const connection = await imapSimple.connect(this.getConfig());
-    await connection.openBox('INBOX');
+    let connection: imapSimple.ImapSimple | undefined;
+    try {
+      connection = await this.connectWithTimeout();
+      await connection.openBox('INBOX');
 
-    const searchCriteria = ['UNSEEN'];
-    const fetchOptions = {
-      bodies: ['HEADER', 'TEXT', ''],
-      markSeen: true,
-      struct: true,
-    };
+      const searchCriteria = ['UNSEEN'];
+      const fetchOptions = {
+        bodies: ['HEADER', 'TEXT', ''],
+        markSeen: true,
+        struct: true,
+      };
 
-    const messages = await connection.search(searchCriteria, fetchOptions);
-    const emails = await this.parseMessages(connection, messages);
+      const messages = await withTimeout(
+        connection.search(searchCriteria, fetchOptions),
+        IMAP_SEARCH_TIMEOUT_MS,
+        'IMAP UNSEEN search',
+      );
+      const emails = await withTimeout(
+        this.parseMessages(connection, messages),
+        IMAP_PARSE_TIMEOUT_MS,
+        'IMAP UNSEEN parse',
+      );
 
-    connection.end();
-    this.logger.log(
-      `IMAP UNSEEN matched ${messages.length} message(s); ${emails.length} had doc attachments`,
-    );
-    return { emails, imapMatchCount: messages.length };
+      this.logger.log(
+        `IMAP UNSEEN matched ${messages.length} message(s); ${emails.length} had doc attachments`,
+      );
+      return { emails, imapMatchCount: messages.length };
+    } finally {
+      this.safeEnd(connection);
+    }
   }
 
   /**
@@ -88,75 +155,120 @@ export class ImapService {
    */
   async fetchAllEmails(): Promise<ImapFetchOutcome> {
     this.logger.log('Connecting to IMAP server (fetch all)...');
-    const connection = await imapSimple.connect(this.getConfig());
-    await connection.openBox('INBOX');
+    let connection: imapSimple.ImapSimple | undefined;
+    try {
+      connection = await this.connectWithTimeout();
+      await connection.openBox('INBOX');
 
-    const searchCriteria = ['ALL'];
-    const fetchOptions = {
-      bodies: ['HEADER', 'TEXT', ''],
-      markSeen: true,
-      struct: true,
-    };
+      const searchCriteria = ['ALL'];
+      const fetchOptions = {
+        bodies: ['HEADER', 'TEXT', ''],
+        markSeen: true,
+        struct: true,
+      };
 
-    const messages = await connection.search(searchCriteria, fetchOptions);
-    const emails = await this.parseMessages(connection, messages);
+      const messages = await withTimeout(
+        connection.search(searchCriteria, fetchOptions),
+        IMAP_SEARCH_TIMEOUT_MS,
+        'IMAP ALL search',
+      );
+      const emails = await withTimeout(
+        this.parseMessages(connection, messages),
+        IMAP_PARSE_TIMEOUT_MS,
+        'IMAP ALL parse',
+      );
 
-    connection.end();
-    this.logger.log(
-      `IMAP ALL matched ${messages.length} message(s); ${emails.length} had doc attachments`,
-    );
-    return { emails, imapMatchCount: messages.length };
+      this.logger.log(
+        `IMAP ALL matched ${messages.length} message(s); ${emails.length} had doc attachments`,
+      );
+      return { emails, imapMatchCount: messages.length };
+    } finally {
+      this.safeEnd(connection);
+    }
   }
 
   /**
-   * Fetch read messages from the last N days that have PDF/XLS attachments.
+   * Fetch messages from the last N days that have PDF/XLS attachments.
    * Prefer this over {@link fetchAllEmails} for HTTP handlers — full inbox scans
    * routinely exceed reverse-proxy timeouts (504).
+   *
+   * NOTE: `markSeen: false` — we must not destroy UNSEEN tracking here, otherwise
+   * every cron tick silently marks 21 days of mail as read and {@link fetchUnreadEmails}
+   * permanently returns 0.
    */
   async fetchRecentEmailsWithAttachments(sinceDays: number = 21): Promise<ImapFetchOutcome> {
     const days = Math.min(Math.max(sinceDays, 1), 90);
     this.logger.log(`Connecting to IMAP (SINCE last ${days} days)...`);
-    const connection = await imapSimple.connect(this.getConfig());
-    await connection.openBox('INBOX');
+    let connection: imapSimple.ImapSimple | undefined;
+    try {
+      connection = await this.connectWithTimeout();
+      await connection.openBox('INBOX');
 
-    // node-imap requires a Date for SINCE (it formats as d-Mon-yyyy in local time)
-    const since = new Date();
-    since.setHours(0, 0, 0, 0);
-    since.setDate(since.getDate() - days);
+      // node-imap requires a Date for SINCE (it formats as d-Mon-yyyy in local time)
+      const since = new Date();
+      since.setHours(0, 0, 0, 0);
+      since.setDate(since.getDate() - days);
 
-    const searchCriteria = [['SINCE', since]];
-    const fetchOptions = {
-      bodies: ['HEADER', 'TEXT', ''],
-      markSeen: true,
-      struct: true,
-    };
+      const searchCriteria = [['SINCE', since]];
+      const fetchOptions = {
+        bodies: ['HEADER', 'TEXT', ''],
+        markSeen: false,
+        struct: true,
+      };
 
-    const messages = await connection.search(searchCriteria, fetchOptions);
-    const emails = await this.parseMessages(connection, messages);
+      const messages = await withTimeout(
+        connection.search(searchCriteria, fetchOptions),
+        IMAP_SEARCH_TIMEOUT_MS,
+        `IMAP SINCE ${days}d search`,
+      );
+      const emails = await withTimeout(
+        this.parseMessages(connection, messages),
+        IMAP_PARSE_TIMEOUT_MS,
+        `IMAP SINCE ${days}d parse`,
+      );
 
-    connection.end();
-    this.logger.log(
-      `IMAP SINCE matched ${messages.length} message(s); ${emails.length} had doc attachments`,
-    );
-    return { emails, imapMatchCount: messages.length };
+      this.logger.log(
+        `IMAP SINCE matched ${messages.length} message(s); ${emails.length} had doc attachments`,
+      );
+      return { emails, imapMatchCount: messages.length };
+    } finally {
+      this.safeEnd(connection);
+    }
   }
 
   /**
    * UNSEEN + SINCE(last N days), merged by Message-ID (unread copy wins).
    * Use for manual import / monitor so read mail is still picked up when it was never saved.
+   *
+   * If the SINCE scan fails (timeout / IMAP error) we still surface the UNSEEN
+   * results — losing recent backfill is preferable to losing fresh mail.
    */
   async fetchUnreadPlusRecentMerged(sinceDays: number = 21): Promise<ImapFetchOutcome> {
     const unread = await this.fetchUnreadEmails();
-    const recent = await this.fetchRecentEmailsWithAttachments(sinceDays);
-    const emails = this.mergePreferUnread(recent.emails, unread.emails);
+
+    let recentEmails: IncomingEmail[] = [];
+    let recentHits = 0;
+    try {
+      const recent = await this.fetchRecentEmailsWithAttachments(sinceDays);
+      recentEmails = recent.emails;
+      recentHits = recent.imapMatchCount;
+    } catch (err) {
+      this.logger.warn(
+        `SINCE-${sinceDays}d scan failed, falling back to UNSEEN only: ${
+          err instanceof Error ? err.message : err
+        }`,
+      );
+    }
+
+    const emails = this.mergePreferUnread(recentEmails, unread.emails);
     this.logger.log(
-      `Merged inbox: UNSEEN ${unread.emails.length} + SINCE ${recent.emails.length} doc-mails → ${emails.length} unique`,
+      `Merged inbox: UNSEEN ${unread.emails.length} + SINCE ${recentEmails.length} doc-mails → ${emails.length} unique`,
     );
     return {
       emails,
-      imapMatchCount: unread.imapMatchCount + recent.imapMatchCount,
+      imapMatchCount: unread.imapMatchCount + recentHits,
       unreadImapHits: unread.imapMatchCount,
-      recentImapHits: recent.imapMatchCount,
+      recentImapHits: recentHits,
     };
   }
 
