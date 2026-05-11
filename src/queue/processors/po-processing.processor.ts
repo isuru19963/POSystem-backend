@@ -28,7 +28,18 @@ export interface MonitorInboxSummary {
   durationMs: number;
 }
 
-@Processor(QUEUE_NAMES.PO_PROCESSING)
+@Processor(QUEUE_NAMES.PO_PROCESSING, {
+  // IMAP scans + PDF/XLS extraction routinely run several minutes and can
+  // block the event loop in chunks longer than BullMQ's 30 s default. Without
+  // these overrides, slow inbox jobs get spuriously moved to "stalled" and
+  // (with `maxStalledCount = 1`) eventually failed despite making progress.
+  // 10-minute lock with 5-minute renew + stalled interval covers the worst
+  // observed IMAP `SINCE 21 days` + multi-attachment fetches on this mailbox.
+  lockDuration: 600_000,
+  lockRenewTime: 300_000,
+  stalledInterval: 600_000,
+  maxStalledCount: 0,
+})
 export class PoProcessingProcessor extends WorkerHost {
   private readonly logger = new Logger(PoProcessingProcessor.name);
 
