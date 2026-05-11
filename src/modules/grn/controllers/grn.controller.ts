@@ -37,9 +37,10 @@ export class GrnController {
   }
 
   /**
-   * Enqueue a GRN-only inbox job (separate from PO manual fetch). Uses the same
-   * IMAP lookback as PO manual (14 days + UNSEEN) but only processes GRN-shaped
-   * messages. Poll `GET /grn/fetch-from-email/status/:jobId` for the summary.
+   * Enqueue a GRN-only inbox job (separate from PO manual fetch). Scans the
+   * entire INBOX (read + unread) and only processes GRN-shaped messages;
+   * Message-ID dedup keeps repeat runs idempotent. Poll
+   * `GET /grn/fetch-from-email/status/:jobId` for the summary.
    */
   @Post('fetch-from-email')
   async fetchFromEmail() {

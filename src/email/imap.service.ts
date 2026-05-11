@@ -151,10 +151,17 @@ export class ImapService {
   }
 
   /**
-   * Fetch ALL emails (including already-read ones) for reprocessing
+   * Fetch every message in INBOX (read or unread) that has a PDF/XLS/CSV
+   * attachment. Use for manual "Fetch from email" buttons where the user wants
+   * everything that exists in the mailbox to land in the DB — the per-message
+   * dedup in {@link PoService.isDuplicateEmail} / GRN's `findByEmailMessageId`
+   * keeps repeat runs idempotent.
+   *
+   * NOTE: `markSeen: false` so we don't destroy UNSEEN tracking — the cron
+   * `fetchUnreadEmails` path still needs to see fresh mail as new.
    */
   async fetchAllEmails(): Promise<ImapFetchOutcome> {
-    this.logger.log('Connecting to IMAP server (fetch all)...');
+    this.logger.log('Connecting to IMAP server (fetch ALL)...');
     let connection: imapSimple.ImapSimple | undefined;
     try {
       connection = await this.connectWithTimeout();
@@ -163,7 +170,7 @@ export class ImapService {
       const searchCriteria = ['ALL'];
       const fetchOptions = {
         bodies: ['HEADER', 'TEXT', ''],
-        markSeen: true,
+        markSeen: false,
         struct: true,
       };
 

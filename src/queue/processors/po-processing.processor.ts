@@ -107,25 +107,26 @@ export class PoProcessingProcessor extends WorkerHost {
   }
 
   /**
-   * Manual button: only PO or only GRN, with a short IMAP lookback so demos
-   * finish in a reasonable time and the two buttons never share one job id.
+   * Manual button: scan the entire INBOX (read or unread) so any PO/GRN that
+   * exists in the mailbox but isn't in the system lands in the DB. The
+   * per-message-ID dedup in PoService / GrnService keeps reruns cheap — only
+   * brand-new mail does extraction + S3 upload + insert.
    */
   private async monitorInboxManual(
     mode: 'po' | 'grn',
   ): Promise<MonitorInboxSummary> {
-    const sinceDays = 14;
     const label = mode === 'po' ? 'PO (manual)' : 'GRN (manual)';
     this.logger.log(
-      `${label}: scanning UNSEEN + last ${sinceDays} days (GRN-like mail ${
+      `${label}: scanning ALL inbox mail (GRN-like ${
         mode === 'po' ? 'skipped' : 'only'
-      })`,
+      }); already-imported messages are deduped via Message-ID`,
     );
-    return this.runInboxMonitor(mode, sinceDays);
+    return this.runInboxMonitor(mode);
   }
 
   private async runInboxMonitor(
     mode: 'full' | 'po' | 'grn',
-    sinceDays: number,
+    sinceDays?: number,
   ): Promise<MonitorInboxSummary> {
     const startedAt = Date.now();
     const summary: MonitorInboxSummary = {
@@ -139,7 +140,11 @@ export class PoProcessingProcessor extends WorkerHost {
     };
 
     try {
-      const fetched = await this.imapService.fetchUnreadPlusRecentMerged(sinceDays);
+      // Manual buttons → full inbox (sinceDays undefined). Cron → merged UNSEEN + SINCE window.
+      const fetched =
+        sinceDays === undefined
+          ? await this.imapService.fetchAllEmails()
+          : await this.imapService.fetchUnreadPlusRecentMerged(sinceDays);
       summary.imapHits = fetched.imapMatchCount;
       const candidates = fetched.emails.filter((email) => {
         const grnLike = isGrnInboundEmail(email.subject, email.attachments);
@@ -149,7 +154,9 @@ export class PoProcessingProcessor extends WorkerHost {
       });
       summary.emailsWithDocs = candidates.length;
       this.logger.log(
-        `Inbox scan (${mode}, ${sinceDays}d): ${fetched.emails.length} doc-mails → ${candidates.length} to process`,
+        `Inbox scan (${mode}, ${
+          sinceDays === undefined ? 'ALL' : `${sinceDays}d`
+        }): ${fetched.emails.length} doc-mails → ${candidates.length} to process`,
       );
 
       for (const email of candidates) {

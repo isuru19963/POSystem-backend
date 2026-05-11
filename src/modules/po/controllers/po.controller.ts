@@ -174,7 +174,8 @@ export class PoController {
 
   /**
    * Enqueue a PO-only inbox job (separate from GRN manual fetch and from the
-   * cron full scan). Uses UNSEEN + last 14 days for a faster demo-friendly run.
+   * cron). Scans the entire INBOX (read + unread) so any PO mail that exists
+   * lands in the DB; the Message-ID dedup makes repeat clicks idempotent.
    * Poll `GET /po/fetch-from-email/status/:jobId` for the summary.
    */
   @Post('fetch-from-email')
