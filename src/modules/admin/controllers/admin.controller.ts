@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { AuthGuard } from '@nestjs/passport';
 import { AdminService } from '../services/admin.service';
+import { OrdersDigestService } from '../services/orders-digest.service';
 import { RolesGuard } from '../../auth/guards/roles.guard';
 import { Roles } from '../../../common/decorators/roles.decorator';
 import { UserRole } from '../../../database/entities';
@@ -30,13 +31,17 @@ import {
   CreateUserDto,
   UpdateUserDto,
   SeedDefaultPricingRulesDto,
+  ImportNotificationContactsCsvDto,
 } from '../dto/admin.dto';
 
 @UseGuards(AuthGuard('jwt'), RolesGuard)
 @Roles(UserRole.ADMIN)
 @Controller('admin')
 export class AdminController {
-  constructor(private readonly adminService: AdminService) {}
+  constructor(
+    private readonly adminService: AdminService,
+    private readonly ordersDigestService: OrdersDigestService,
+  ) {}
 
   // --- Vendors ---
   @Get('vendors')
@@ -329,5 +334,17 @@ export class AdminController {
   @Delete('notification-contacts/:id')
   deleteNotificationContact(@Param('id', ParseUUIDPipe) id: string) {
     return this.adminService.deleteNotificationContact(id, 'system');
+  }
+
+  /** Bulk-import notification contacts from pasted CSV (comma or tab separated). */
+  @Post('notification-contacts/import-csv')
+  importNotificationContactsCsv(@Body() body: ImportNotificationContactsCsvDto) {
+    return this.adminService.importNotificationContactsFromCsv(body.csv, 'system');
+  }
+
+  /** Send Today's Orders digest now (same message as the daily 08:00 IST cron). */
+  @Post('notification-contacts/send-todays-digest')
+  sendTodaysOrdersDigest() {
+    return this.ordersDigestService.sendTodaysOrdersDigest();
   }
 }

@@ -21,10 +21,14 @@ import {
 import { AdminController } from './controllers/admin.controller';
 import { AdminService } from './services/admin.service';
 import { AuthModule } from '../auth/auth.module';
+import { WhatsappModule } from '../../whatsapp/whatsapp.module';
+import { OrdersDigestService } from './services/orders-digest.service';
+import { OrdersDigestScheduler } from './schedulers/orders-digest.scheduler';
 
 @Module({
   imports: [
     AuthModule,
+    WhatsappModule,
     TypeOrmModule.forFeature([
       Vendor,
       Sku,
@@ -45,7 +49,7 @@ import { AuthModule } from '../auth/auth.module';
     ]),
   ],
   controllers: [AdminController],
-  providers: [AdminService],
-  exports: [AdminService],
+  providers: [AdminService, OrdersDigestService, OrdersDigestScheduler],
+  exports: [AdminService, OrdersDigestService],
 })
 export class AdminModule {}

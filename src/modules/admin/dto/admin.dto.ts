@@ -318,3 +318,10 @@ export class UpdateUserDto {
   @IsBoolean()
   isActive?: boolean;
 }
+
+/** Paste CSV for WhatsApp notification contacts: optional header `phone,label` */
+export class ImportNotificationContactsCsvDto {
+  @IsString()
+  @MinLength(1)
+  csv!: string;
+}

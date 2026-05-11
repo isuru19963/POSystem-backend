@@ -944,4 +944,98 @@ export class AdminService {
     await this.createAuditLog(userId, 'notification_contact', id, 'delete', { ...contact } as unknown as Record<string, unknown>, {});
     await this.notifContactRepo.remove(contact);
   }
+
+  /**
+   * Bulk-import WhatsApp numbers from CSV (comma or tab separated).
+   * Optional header: phone,label — otherwise each line is phone only or phone,label.
+   */
+  async importNotificationContactsFromCsv(
+    csvRaw: string,
+    userId: string,
+  ): Promise<{
+    created: number;
+    updated: number;
+    skipped: number;
+    errors: Array<{ line: number; message: string }>;
+  }> {
+    const lines = csvRaw
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    let startIdx = 0;
+    if (
+      lines.length > 0 &&
+      /^(phone|whatsapp|number|mobile)\b/i.test(lines[0])
+    ) {
+      startIdx = 1;
+    }
+
+    let created = 0;
+    let updated = 0;
+    let skipped = 0;
+    const errors: Array<{ line: number; message: string }> = [];
+
+    for (let i = startIdx; i < lines.length; i++) {
+      const lineNum = i + 1;
+      const parts = lines[i]
+        .split(/[,\t]/)
+        .map((s) => s.trim().replace(/^["']|["']$/g, ''))
+        .filter((s) => s.length > 0);
+      if (parts.length === 0) {
+        skipped++;
+        continue;
+      }
+
+      try {
+        const phone = this.normalizeWhatsappPhone(parts[0]);
+        const label =
+          (parts[1] && parts[1].trim()) ||
+          `Contact ${phone.replace(/^\+/, '')}`;
+
+        const existing = await this.notifContactRepo.findOne({
+          where: { phone },
+        });
+        if (existing) {
+          if (label && label !== existing.label) {
+            existing.label = label;
+            await this.notifContactRepo.save(existing);
+            updated++;
+          } else {
+            skipped++;
+          }
+        } else {
+          const contact = await this.notifContactRepo.save(
+            this.notifContactRepo.create({
+              phone,
+              label,
+              isActive: true,
+            }),
+          );
+          created++;
+          await this.createAuditLog(
+            userId,
+            'notification_contact',
+            contact.id,
+            'create',
+            {},
+            { label: contact.label, phone: contact.phone, source: 'csv_import' },
+          );
+        }
+      } catch (e) {
+        errors.push({
+          line: lineNum,
+          message: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
+
+    await this.createAuditLog(userId, 'notification_contact', 'csv-import', 'import_csv', {}, {
+      created,
+      updated,
+      skipped,
+      errorCount: errors.length,
+    });
+
+    return { created, updated, skipped, errors };
+  }
 }
