@@ -179,6 +179,7 @@ export class AdminController {
    * and re-point the PO to the correct vendor row. Fixes legacy rows where the
    * customer was saved as a label (e.g. "PO No :") before parser fixes shipped.
    */
+  @Roles(UserRole.ADMIN, UserRole.MANAGER)
   @Post('po/by-number/:poNumber/repair-customer-from-source')
   repairPoCustomerFromSource(@Param('poNumber') poNumber: string) {
     return this.adminService.repairPurchaseOrderCustomerFromStoredSource(

@@ -275,22 +275,27 @@ export class PdfExtractionService {
     // Customer = "Bill To" company — label and value are on separate lines:
     // Line N:   "Bill To :       Shipped To :"
     // Line N+1: "Zomato Hyperpure Pvt Ltd (CPC-MUM5)     Zomato Hyperpure Pvt Ltd ..."
+    // Some PO SCHEDULE PDFs mis-order text so the first line under Bill To is a PO header (e.g. "PO No : …").
     let vendorName = '';
     /** Hub / DC code from Bill To line, e.g. "(HYD3)" — PO SCHEDULE uses "Ship To" not "Shipped To". */
     let billToHubCode = '';
     for (let i = 0; i < lines.length; i++) {
       if (/Bill\s*To\s*:/i.test(lines[i])) {
-        // Next non-empty line has the company name; take the left-column part (before tab)
-        for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-          const raw = lines[j].split('\t')[0].trim();
-          const hub = raw.match(/\(([A-Z]+-[A-Z0-9]+|[A-Z]{2,}\d+[A-Z]?)\)/i);
-          if (hub) billToHubCode = hub[1];
-          // Strip trailing location code like "(CPC-MUM5)" / "(HYD3)"
-          const name = raw.replace(/\s*\([^)]+\)\s*$/, '').trim();
-          if (name && name.length > 2) {
-            vendorName = name;
-            break;
+        for (let j = i + 1; j < Math.min(i + 10, lines.length); j++) {
+          const line = lines[j];
+          const cols = line.split(/\t+/).map((c) => c.trim()).filter(Boolean);
+          const candidates = cols.length ? cols : [line.trim()].filter(Boolean);
+
+          for (const raw of candidates) {
+            const hub = raw.match(/\(([A-Z]+-[A-Z0-9]+|[A-Z]{2,}\d+[A-Z]?)\)/i);
+            if (hub) billToHubCode = billToHubCode || hub[1];
+            const name = raw.replace(/\s*\([^)]+\)\s*$/, '').trim();
+            if (name.length > 2 && !this.isGarbageVendorLabel(name)) {
+              vendorName = name;
+              break;
+            }
           }
+          if (vendorName) break;
         }
         break;
       }
@@ -315,6 +320,14 @@ export class PdfExtractionService {
     let shippedTo = shipToLineMatch ? shipToLineMatch[1].trim() : '';
     if (shippedTo.includes('\t')) {
       shippedTo = shippedTo.split('\t').pop()?.trim() || shippedTo;
+    }
+
+    if (!vendorName || this.isGarbageVendorLabel(vendorName)) {
+      vendorName = '';
+      const fromShip = shippedTo.replace(/\s*\([^)]+\)\s*$/, '').trim();
+      if (fromShip.length > 2 && !this.isGarbageVendorLabel(fromShip)) {
+        vendorName = fromShip;
+      }
     }
 
     // Extract hub code like CPC-MUM5, HYD3 from parentheses
