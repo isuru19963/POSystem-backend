@@ -111,6 +111,7 @@ export class AiPoExtractionService {
       '}',
       'Rules:',
       '- Keep unknown fields as empty string or 0.',
+      '- vendorName must be the buyer / bill-to legal company name, never a field label like "PO No :" or "Address".',
       '- quantity/price/mrp/total/grandTotal must be numbers.',
       '- Hyperpure "PO SCHEDULE" PDFs often list only scheduled quantities (no unit price); use 0 for missing price/total.',
       '- Do not include markdown or code fences.',
@@ -157,8 +158,18 @@ export class AiPoExtractionService {
         }))
       : [];
 
+    const junkVendor = (v: string) =>
+      /^PO\s*No\.?\s*:?\s*$/i.test(v) ||
+      /^P\.?O\.?\s*Number\s*:?\s*$/i.test(v) ||
+      /^Address\s*:?\s*$/i.test(v) ||
+      /^Vendor\s*Name\s*:?\s*$/i.test(v);
+
     return {
-      vendorName: data?.vendorName ? String(data.vendorName).trim() : undefined,
+      vendorName: (() => {
+        const v = data?.vendorName ? String(data.vendorName).trim() : undefined;
+        if (!v || junkVendor(v)) return undefined;
+        return v;
+      })(),
       vendorCode: data?.vendorCode ? String(data.vendorCode).trim() : undefined,
       vendorGstin: data?.vendorGstin ? String(data.vendorGstin).trim() : undefined,
       poNumber: data?.poNumber ? String(data.poNumber).trim() : undefined,

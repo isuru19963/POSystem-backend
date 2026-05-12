@@ -577,9 +577,14 @@ export class PdfExtractionService {
     // Text after "Billing Address" up to the next major section
     const billingMatch = text.match(/Billing\s*Address[\s\S]*?Address\s*:\s*([^\n]+)/i);
     if (billingMatch) {
-      // First line of the address is typically the company name
       const firstLine = billingMatch[1].trim();
-      if (firstLine && firstLine.length > 2) return firstLine;
+      if (
+        firstLine &&
+        firstLine.length > 2 &&
+        !this.isGarbageVendorLabel(firstLine)
+      ) {
+        return firstLine;
+      }
     }
     // Fallback: look for a line right after "Billing Address" header
     const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -593,6 +598,7 @@ export class PdfExtractionService {
             !/^GSTIN\s*:/i.test(line) &&
             !/^PAN\s*:/i.test(line) &&
             !/^Shipping\s*Address/i.test(line) &&
+            !this.isGarbageVendorLabel(line) &&
             line.length > 4
           ) {
             return line;
@@ -628,6 +634,7 @@ export class PdfExtractionService {
             !/^Phone\s*:/i.test(line) &&
             !/^State\s*:/i.test(line) &&
             !/^Billing\s*Address/i.test(line) &&
+            !this.isGarbageVendorLabel(line) &&
             line.length > 4
           ) {
             return line;
@@ -672,6 +679,7 @@ export class PdfExtractionService {
 
     const vendorName = this.pickCounterpartyName(
       this.extractBillingAddressCompany(text),
+      this.extractShippingAddressCompany(text),
       this.extractVendorName(lines),
     );
     const vendorGstin = this.extractField(lines, /GSTIN\s*:(\S+)/i);
@@ -778,14 +786,40 @@ export class PdfExtractionService {
     return this.ownCompanyPatterns.some((p) => p.test(name));
   }
 
+  /** Labels and junk that pdf-parse sometimes puts where a company name should be. */
+  private isGarbageVendorLabel(name: string): boolean {
+    const t = name.trim();
+    if (t.length < 2) return true;
+    if (/^PO\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;
+    if (/^P\.?O\.?\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^Purchase\s*Order\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^PO\s*Date\s*:?\s*$/i.test(t)) return true;
+    if (/^Expected\s*Delivery/i.test(t)) return true;
+    if (/^GSTIN\s*:?\s*$/i.test(t)) return true;
+    if (/^PAN\s*:?\s*$/i.test(t)) return true;
+    if (/^Address\s*:?\s*$/i.test(t)) return true;
+    if (/^Vendor\s*Name\s*:?\s*$/i.test(t)) return true;
+    if (/^Billing\s*Address\s*:?\s*$/i.test(t)) return true;
+    if (/^Ship(?:ping)?\s*(?:To|From)\s*:?\s*$/i.test(t)) return true;
+    if (/^(buyer|customer|vendor|consignee|bill\s*to)\s*:\s*$/i.test(t)) return true;
+    return false;
+  }
+
   private pickCounterpartyName(...candidates: Array<string | undefined>): string {
     for (const candidate of candidates) {
       if (!candidate) continue;
       const c = candidate.trim();
-      if (!c) continue;
+      if (!c || this.isGarbageVendorLabel(c)) continue;
       if (!this.isOwnCompanyName(c)) return c;
     }
-    return candidates.find((c) => !!c && c.trim().length > 0)?.trim() || '';
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      const c = candidate.trim();
+      if (!c || this.isGarbageVendorLabel(c)) continue;
+      return c;
+    }
+    return '';
   }
 
   private extractMoonstoneCounterpartyName(text: string, lines: string[]): string {
@@ -921,7 +955,8 @@ export class PdfExtractionService {
             line &&
             !line.startsWith('Billing') &&
             !line.startsWith('Shipping') &&
-            !/^CLOUDSTORE/i.test(line)
+            !/^CLOUDSTORE/i.test(line) &&
+            !this.isGarbageVendorLabel(line)
           ) {
             return line;
           }
@@ -931,7 +966,10 @@ export class PdfExtractionService {
     // Fallback: look for "Vendor Name :" pattern
     for (const line of lines) {
       const m = line.match(/Vendor\s*Name\s*:\s*(.+)/i);
-      if (m) return m[1].trim();
+      if (m) {
+        const v = m[1].trim();
+        if (!this.isGarbageVendorLabel(v)) return v;
+      }
     }
     return '';
   }
