@@ -29,6 +29,11 @@ import {
   PricingRuleType,
 } from '../../../database/entities';
 import { SeedDefaultPricingRulesDto } from '../dto/admin.dto';
+import { PdfExtractionService, PdfExtractionResult } from '../../po/services/pdf-extraction.service';
+import { XlsExtractionService } from '../../po/services/xls-extraction.service';
+import { StorageService } from '../../../storage/storage.service';
+import { ValidationService } from '../../validation/services/validation.service';
+import { isOwnCompanyName } from '../../po/services/own-company';
 
 @Injectable()
 export class AdminService {
@@ -88,6 +93,10 @@ export class AdminService {
     @InjectRepository(VendorPricingRule)
     private readonly vendorPricingRuleRepo: Repository<VendorPricingRule>,
     private readonly dataSource: DataSource,
+    private readonly storageService: StorageService,
+    private readonly pdfExtractionService: PdfExtractionService,
+    private readonly xlsExtractionService: XlsExtractionService,
+    private readonly validationService: ValidationService,
   ) {}
 
   async purgeAllPOs(): Promise<{ deleted: Record<string, number> }> {
@@ -633,6 +642,172 @@ export class AdminService {
     } finally {
       await runner.release();
     }
+  }
+
+  /** Mirrors PdfExtractionService garbage checks for customer display strings. */
+  private isGarbageCustomerLabel(name: string): boolean {
+    const t = name.trim();
+    if (t.length < 2) return true;
+    if (/^PO\s*No\.?\s*:/i.test(t)) return true;
+    if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;
+    if (/^P\.?O\.?\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^Purchase\s*Order\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^PO\s*Date\s*:?\s*$/i.test(t)) return true;
+    if (/^Expected\s*Delivery/i.test(t)) return true;
+    if (/^GSTIN\s*:?\s*$/i.test(t)) return true;
+    if (/^PAN\s*:?\s*$/i.test(t)) return true;
+    if (/^Address\s*:?\s*$/i.test(t)) return true;
+    if (/^Vendor\s*Name\s*:?\s*$/i.test(t)) return true;
+    if (/^Billing\s*Address\s*:?\s*$/i.test(t)) return true;
+    if (/^Ship(?:ping)?\s*(?:To|From)\s*:?\s*$/i.test(t)) return true;
+    if (/^(buyer|customer|vendor|consignee|bill\s*to)\s*:\s*$/i.test(t)) return true;
+    return false;
+  }
+
+  private extractionVendorIsUsable(name: string): boolean {
+    const t = name.trim();
+    return !!t && !this.isGarbageCustomerLabel(t) && !isOwnCompanyName(t);
+  }
+
+  /**
+   * Re-fetch the PO’s stored PDF/XLS from S3, re-extract the buyer, and update
+   * `vendor_id` + shipping location. Use after shipping parser fixes for rows
+   * that were persisted with label junk (e.g. "PO No :") as the customer name.
+   */
+  async repairPurchaseOrderCustomerFromStoredSource(
+    poNumber: string,
+    userId: string,
+  ): Promise<{
+    purchaseOrderId: string;
+    repairedPurchaseOrderIds: string[];
+    poNumber: string;
+    previousVendorId: string;
+    previousVendorName: string;
+    newVendorId: string;
+    newVendorName: string;
+    shippingLocation: string;
+  }> {
+    const trimmed = poNumber.trim();
+    if (!trimmed) throw new BadRequestException('poNumber is required');
+
+    const pos = await this.poRepo.find({
+      where: { poNumber: trimmed },
+      relations: ['vendor'],
+      order: { createdAt: 'ASC' },
+    });
+    if (!pos.length) {
+      throw new NotFoundException(`No purchase order found for number ${trimmed}`);
+    }
+
+    const junkVendor = (v?: Vendor | null) =>
+      this.isGarbageCustomerLabel(v?.name ?? '');
+    const hasKey = (p: PurchaseOrder) => !!(p.rawFileKey || p.rawXlsFileKey);
+
+    let rowsToRepair = pos.filter((p) => junkVendor(p.vendor));
+    if (!rowsToRepair.length) {
+      rowsToRepair = [pos.find(hasKey) ?? pos[0]];
+    }
+
+    const sourceRow =
+      rowsToRepair.find(hasKey) ?? pos.find(hasKey) ?? rowsToRepair[0];
+
+    const s3Key = sourceRow.rawFileKey || sourceRow.rawXlsFileKey;
+    if (!s3Key) {
+      throw new BadRequestException(
+        'This PO has no stored PDF/XLS key on S3 (rawFileKey / rawXlsFileKey empty). Re-upload the file to repair.',
+      );
+    }
+
+    const buffer = await this.storageService.getFile(s3Key);
+    let extracted: PdfExtractionResult;
+    const lower = s3Key.toLowerCase();
+    if (lower.endsWith('.pdf')) {
+      extracted = await this.pdfExtractionService.extract(buffer);
+    } else if (/\.(xls|xlsx|csv)$/i.test(lower)) {
+      const base = s3Key.split('/').pop() || s3Key;
+      extracted = this.xlsExtractionService.extract(buffer, base);
+    } else {
+      throw new BadRequestException(
+        `Unsupported stored file type for key ${s3Key}; expected .pdf, .xls, .xlsx, or .csv`,
+      );
+    }
+
+    const vendorName = (extracted.vendorName ?? '').trim();
+    if (!this.extractionVendorIsUsable(vendorName)) {
+      throw new BadRequestException(
+        `Re-extraction did not produce a usable customer name (got "${vendorName || '(empty)'}").`,
+      );
+    }
+
+    let vendor =
+      (await this.vendorRepo.findOne({ where: { name: vendorName } })) ||
+      (await this.vendorRepo.findOne({ where: { code: vendorName } }));
+    if (!vendor) {
+      vendor = this.vendorRepo.create({
+        name: vendorName,
+        code: vendorName.replace(/\s+/g, '_').substring(0, 50),
+      });
+      vendor = await this.vendorRepo.save(vendor);
+    }
+
+    const shipLoc = extracted.shippingLocation?.trim() ?? '';
+    const repairedIds: string[] = [];
+    let firstPreviousVendorId = '';
+    let firstPreviousVendorName = '';
+
+    for (const row of rowsToRepair) {
+      const previousVendorId = row.vendorId;
+      const previousVendorName = row.vendor?.name ?? '';
+      if (!firstPreviousVendorId) {
+        firstPreviousVendorId = previousVendorId;
+        firstPreviousVendorName = previousVendorName;
+      }
+
+      row.vendorId = vendor.id;
+      if (shipLoc) {
+        row.shippingLocation = shipLoc;
+      }
+      row.extractedData = {
+        ...(row.extractedData ?? {}),
+        repairedCustomerFromSourceAt: new Date().toISOString(),
+        repairedFromS3Key: s3Key,
+        repairedExtractionVendorName: vendorName,
+        repairedExtractionShippingLocation: extracted.shippingLocation ?? '',
+      };
+
+      await this.poRepo.save(row);
+      repairedIds.push(row.id);
+
+      await this.createAuditLog(userId, 'purchase_order', row.id, 'repair_customer', {
+        poNumber: row.poNumber,
+        previousVendorId,
+        previousVendorName,
+        newVendorId: vendor.id,
+        newVendorName: vendor.name,
+        shippingLocation: row.shippingLocation,
+      }, {});
+
+      try {
+        await this.validationService.validatePo(row.id);
+      } catch (err) {
+        this.logger.warn(
+          `validatePo failed after customer repair for ${row.poNumber}: ${(err as Error)?.message}`,
+        );
+      }
+    }
+
+    const primary = rowsToRepair[0];
+
+    return {
+      purchaseOrderId: primary.id,
+      repairedPurchaseOrderIds: repairedIds,
+      poNumber: primary.poNumber,
+      previousVendorId: firstPreviousVendorId,
+      previousVendorName: firstPreviousVendorName,
+      newVendorId: vendor.id,
+      newVendorName: vendor.name,
+      shippingLocation: primary.shippingLocation,
+    };
   }
 
   async deleteGrnByNumber(grnNumber: string, userId: string): Promise<{ deletedGrnNumber: string }> {

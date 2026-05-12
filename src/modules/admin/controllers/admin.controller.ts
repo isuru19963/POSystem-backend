@@ -174,6 +174,19 @@ export class AdminController {
     return this.adminService.deletePoByNumber(poNumber, 'system');
   }
 
+  /**
+   * Re-download the PO’s stored PDF/XLS from S3, re-extract customer + ship-to,
+   * and re-point the PO to the correct vendor row. Fixes legacy rows where the
+   * customer was saved as a label (e.g. "PO No :") before parser fixes shipped.
+   */
+  @Post('po/by-number/:poNumber/repair-customer-from-source')
+  repairPoCustomerFromSource(@Param('poNumber') poNumber: string) {
+    return this.adminService.repairPurchaseOrderCustomerFromStoredSource(
+      decodeURIComponent(poNumber),
+      'system',
+    );
+  }
+
   @Delete('grn/by-number/:grnNumber')
   deleteGrnByNumber(@Param('grnNumber') grnNumber: string) {
     return this.adminService.deleteGrnByNumber(grnNumber, 'system');
