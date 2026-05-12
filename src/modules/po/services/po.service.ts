@@ -92,6 +92,176 @@ export class PoService {
     return !!existing;
   }
 
+  /** Prefer rows with shipping, totals, line items, and a specific legal-entity vendor name. */
+  private poCompletenessScore(po: PurchaseOrder): number {
+    let s = 0;
+    if (po.shippingLocation?.trim()) s += 3;
+    if (po.expectedDeliveryDate) s += 2;
+    if (po.totalAmount != null && Number(po.totalAmount) > 0) s += 3;
+    s += (po.lineItems?.length ?? 0) * 2;
+    const vn = (po.vendor?.name ?? '').trim().toLowerCase();
+    if (vn && vn !== 'hyperpure') s += 2;
+    return s;
+  }
+
+  private shouldPreferIncomingVendor(
+    incoming: Vendor,
+    existingPo: PurchaseOrder,
+  ): boolean {
+    const oldName = (existingPo.vendor?.name ?? '').trim();
+    const newName = incoming.name.trim();
+    if (!oldName) return true;
+    if (/^hyperpure$/i.test(oldName) && /hyperpure/i.test(newName)) return true;
+    if (newName.length > oldName.length + 8) return true;
+    return false;
+  }
+
+  /**
+   * Same PO number was stored more than once because the unique key is (poNumber, vendorId)
+   * and extraction sometimes used "Hyperpure" vs "Zomato Hyperpure Pvt. Ltd.".
+   * Merge onto the most complete row and drop empty duplicate siblings that have no GRN/delivery.
+   */
+  private async mergeDuplicatePosByNumber(
+    poNumber: string,
+    data: {
+      poDate: Date;
+      vendorName: string;
+      shippingLocation: string;
+      rawFileKey?: string;
+      rawXlsFileKey?: string;
+      emailMessageId: string;
+      expectedDeliveryDate?: Date;
+      expiryDate?: Date;
+      paymentTerms?: string;
+      totalAmount?: number;
+      lineItems?: ExtractedLineItem[];
+      extractedData?: Record<string, unknown>;
+    },
+    resolvedVendor: Vendor,
+  ): Promise<PurchaseOrder | null> {
+    const trimmed = poNumber.trim();
+    if (!trimmed) return null;
+
+    const siblings = await this.poRepo.find({
+      where: { poNumber: trimmed },
+      relations: ['vendor', 'lineItems', 'deliveries', 'grns'],
+    });
+    if (siblings.length === 0) return null;
+
+    const best = siblings.reduce((a, b) => {
+      const sa = this.poCompletenessScore(a);
+      const sb = this.poCompletenessScore(b);
+      if (sb !== sa) return sb > sa ? b : a;
+      return new Date(a.createdAt).getTime() <= new Date(b.createdAt).getTime() ? a : b;
+    });
+
+    let dirty = false;
+    if (!best.shippingLocation?.trim() && data.shippingLocation?.trim()) {
+      best.shippingLocation = data.shippingLocation;
+      dirty = true;
+    }
+    if (!best.expectedDeliveryDate && data.expectedDeliveryDate) {
+      best.expectedDeliveryDate = data.expectedDeliveryDate;
+      dirty = true;
+    }
+    if (!best.expiryDate && data.expiryDate) {
+      best.expiryDate = data.expiryDate;
+      dirty = true;
+    }
+    if (!best.paymentTerms?.trim() && data.paymentTerms?.trim()) {
+      best.paymentTerms = data.paymentTerms;
+      dirty = true;
+    }
+    if ((best.totalAmount == null || Number(best.totalAmount) <= 0) && data.totalAmount != null) {
+      best.totalAmount = data.totalAmount;
+      dirty = true;
+    }
+    if (!best.rawFileKey && data.rawFileKey) {
+      best.rawFileKey = data.rawFileKey;
+      dirty = true;
+    }
+    if (!best.rawXlsFileKey && data.rawXlsFileKey) {
+      best.rawXlsFileKey = data.rawXlsFileKey;
+      dirty = true;
+    }
+    if (!best.emailMessageId?.trim() && data.emailMessageId?.trim()) {
+      best.emailMessageId = data.emailMessageId;
+      dirty = true;
+    }
+
+    if (this.shouldPreferIncomingVendor(resolvedVendor, best) && best.vendorId !== resolvedVendor.id) {
+      best.vendorId = resolvedVendor.id;
+      dirty = true;
+    }
+
+    if (data.extractedData && Object.keys(data.extractedData).length > 0) {
+      best.extractedData = {
+        ...(best.extractedData ?? {}),
+        ...data.extractedData,
+        mergedFromDuplicatePoNumber: true,
+      } as Record<string, unknown>;
+      dirty = true;
+    }
+
+    if (dirty) await this.poRepo.save(best);
+
+    const liCount = await this.lineItemRepo.count({ where: { purchaseOrderId: best.id } });
+    if (liCount === 0 && data.lineItems && data.lineItems.length > 0) {
+      const lineItemEntities: PurchaseOrderLineItem[] = [];
+      for (const item of data.lineItems) {
+        const sku = await this.skuRepo.findOne({ where: { code: item.skuCode } });
+        lineItemEntities.push(
+          this.lineItemRepo.create({
+            purchaseOrderId: best.id,
+            itemCode: item.skuCode,
+            itemName: item.skuName,
+            hsnCode: item.hsnCode,
+            skuId: sku?.id,
+            quantity: item.quantity,
+            poPrice: item.price,
+            poMrp: item.mrp,
+          }),
+        );
+      }
+      await this.lineItemRepo.save(lineItemEntities);
+      this.logger.log(
+        `Enriched PO ${trimmed}: added ${lineItemEntities.length} line items from a later email/extraction.`,
+      );
+    }
+
+    const winnerScore = this.poCompletenessScore(best);
+    for (const loser of siblings) {
+      if (loser.id === best.id) continue;
+      const dCount = loser.deliveries?.length ?? 0;
+      const gCount = loser.grns?.length ?? 0;
+      const loserLiCount = await this.lineItemRepo.count({
+        where: { purchaseOrderId: loser.id },
+      });
+      if (
+        dCount === 0 &&
+        gCount === 0 &&
+        loserLiCount === 0 &&
+        this.poCompletenessScore(loser) < winnerScore
+      ) {
+        this.logger.warn(
+          `Removing incomplete duplicate PO row ${loser.id} (${loser.poNumber}, vendor=${loser.vendor?.name}) in favour of ${best.id}.`,
+        );
+        await this.removeById(loser.id);
+      }
+    }
+
+    try {
+      await this.validationService.validatePo(best.id);
+    } catch (err) {
+      this.logger.error(
+        `Auto-validation failed after PO merge for ${trimmed}: ${(err as Error)?.message}`,
+      );
+    }
+
+    this.logger.log(`Merged duplicate PO number ${trimmed} onto PO id ${best.id}.`);
+    return this.findById(best.id);
+  }
+
   /** Check for duplicate by email message ID (any common Message-ID formatting). */
   async isDuplicateEmail(emailMessageId: string): Promise<boolean> {
     const variants = messageIdSearchVariants(emailMessageId);
@@ -117,6 +287,10 @@ export class PoService {
     lineItems?: ExtractedLineItem[];
     extractedData?: Record<string, unknown>;
   }): Promise<PurchaseOrder> {
+    data.poNumber = data.poNumber.trim();
+    if (!data.poNumber) {
+      throw new BadRequestException('PO number is required');
+    }
     // Defensive guard: if extraction accidentally returned our own company as
     // the customer/vendor, fall back to a placeholder so we never persist
     // ourselves as the buyer. This complements the per-extractor filters.
@@ -147,6 +321,11 @@ export class PoService {
         code: data.vendorName.replace(/\s+/g, '_').substring(0, 50),
       });
       vendor = await this.vendorRepo.save(vendor);
+    }
+
+    const merged = await this.mergeDuplicatePosByNumber(data.poNumber, data, vendor);
+    if (merged) {
+      return merged;
     }
 
     // Check for duplicate

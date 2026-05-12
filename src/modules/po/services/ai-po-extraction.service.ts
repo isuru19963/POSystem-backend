@@ -34,7 +34,8 @@ export class AiPoExtractionService {
 
   async extractFromText(rawText: string): Promise<AiPoExtractionResult | null> {
     const apiKey = process.env.GEMINI_API_KEY;
-    const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
+    // `gemini-2.0-flash-lite` is not always enabled on API keys; `gemini-2.0-flash` is widely available.
+    const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
     if (!apiKey) return null;
 
     try {
@@ -53,6 +54,7 @@ export class AiPoExtractionService {
           generationConfig: {
             temperature: 0,
             topP: 0.95,
+            maxOutputTokens: 8192,
             responseMimeType: 'application/json',
           },
         }),
@@ -110,6 +112,7 @@ export class AiPoExtractionService {
       'Rules:',
       '- Keep unknown fields as empty string or 0.',
       '- quantity/price/mrp/total/grandTotal must be numbers.',
+      '- Hyperpure "PO SCHEDULE" PDFs often list only scheduled quantities (no unit price); use 0 for missing price/total.',
       '- Do not include markdown or code fences.',
       '',
       'PO_TEXT_START',

@@ -132,6 +132,41 @@ export class PdfExtractionService {
     ruleResult: PdfExtractionResult,
     aiResult: AiPoExtractionResult,
   ): PdfExtractionResult {
+    const ruleCount = ruleResult.lineItems?.length ?? 0;
+    const aiLines = aiResult.lineItems || [];
+    const aiCount = aiLines.length;
+
+    const useAiLineItems =
+      aiCount > 0 &&
+      (ruleCount === 0 ||
+        aiCount > ruleCount ||
+        (ruleCount > 0 &&
+          (ruleResult.lineItems ?? []).every(
+            (li) => (Number(li.price) || 0) === 0 && (Number(li.total) || 0) === 0,
+          )));
+
+    const mergedLineItems = useAiLineItems
+      ? aiLines.map((li) => ({
+          skuCode: li.skuCode,
+          skuName: li.skuName,
+          hsnCode: li.hsnCode,
+          quantity: li.quantity,
+          price: li.price,
+          mrp: li.mrp,
+          total: li.total,
+        }))
+      : ruleResult.lineItems?.length
+        ? ruleResult.lineItems
+        : aiLines.map((li) => ({
+            skuCode: li.skuCode,
+            skuName: li.skuName,
+            hsnCode: li.hsnCode,
+            quantity: li.quantity,
+            price: li.price,
+            mrp: li.mrp,
+            total: li.total,
+          }));
+
     const merged: PdfExtractionResult = {
       ...ruleResult,
       vendorName: ruleResult.vendorName || aiResult.vendorName || '',
@@ -144,17 +179,7 @@ export class PdfExtractionService {
       paymentTerms: ruleResult.paymentTerms || aiResult.paymentTerms,
       shippingLocation: ruleResult.shippingLocation || aiResult.shippingLocation || '',
       grandTotal: ruleResult.grandTotal ?? aiResult.grandTotal,
-      lineItems: ruleResult.lineItems?.length
-        ? ruleResult.lineItems
-        : (aiResult.lineItems || []).map((li) => ({
-            skuCode: li.skuCode,
-            skuName: li.skuName,
-            hsnCode: li.hsnCode,
-            quantity: li.quantity,
-            price: li.price,
-            mrp: li.mrp,
-            total: li.total,
-          })),
+      lineItems: mergedLineItems,
       extractionMethod: 'hybrid',
     };
 
@@ -201,12 +226,19 @@ export class PdfExtractionService {
 
     const poNumber =
       getNextLineValue(/^Purchase Order Number$/i) ||
+      getNextLineValue(/^Purchase Order No\s*:?$/i) ||
       this.extractField(lines, /Purchase Order No\s*:\s*(\S+)/i) ||
       '';
 
+    // Label is often "Purchase Order Date :" on its own line; avoid extractField()
+    // join fallback — greedy (.+) would swallow the rest of the document.
     const poDate =
       getNextLineValue(/^Purchase Order Date$/i) ||
-      this.extractField(lines, /Purchase Order Date\s*:\s*(.+)/i) ||
+      getNextLineValue(/^Purchase Order Date\s*:?$/i) ||
+      this.extractField(
+        lines,
+        /Purchase Order Date\s*:\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i,
+      ) ||
       '';
 
     // Full PO: label "Expected Delivery Date" on one line, value on the next.
@@ -227,14 +259,21 @@ export class PdfExtractionService {
     // Line N:   "Bill To :       Shipped To :"
     // Line N+1: "Zomato Hyperpure Pvt Ltd (CPC-MUM5)     Zomato Hyperpure Pvt Ltd ..."
     let vendorName = '';
+    /** Hub / DC code from Bill To line, e.g. "(HYD3)" — PO SCHEDULE uses "Ship To" not "Shipped To". */
+    let billToHubCode = '';
     for (let i = 0; i < lines.length; i++) {
       if (/Bill\s*To\s*:/i.test(lines[i])) {
         // Next non-empty line has the company name; take the left-column part (before tab)
         for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
           const raw = lines[j].split('\t')[0].trim();
-          // Strip trailing location code like "(CPC-MUM5)"
+          const hub = raw.match(/\(([A-Z]+-[A-Z0-9]+|[A-Z]{2,}\d+[A-Z]?)\)/i);
+          if (hub) billToHubCode = hub[1];
+          // Strip trailing location code like "(CPC-MUM5)" / "(HYD3)"
           const name = raw.replace(/\s*\([^)]+\)\s*$/, '').trim();
-          if (name && name.length > 2) { vendorName = name; break; }
+          if (name && name.length > 2) {
+            vendorName = name;
+            break;
+          }
         }
         break;
       }
@@ -252,21 +291,24 @@ export class PdfExtractionService {
       ? vendorAddrMatch[1].replace(/\n/g, ', ').replace(/\s+/g, ' ').trim()
       : undefined;
 
-    // Shipped To: "Zomato Hyperpure Pvt Ltd (CPC-MUM5)" — extract location code
-    // Bill To and Shipped To may be tab-separated on the same line
-    const shippedToMatch = text.match(/Shipped To\s*:\s*\n?\s*(.+)/i);
-    let shippedTo = shippedToMatch ? shippedToMatch[1].trim() : '';
-    // If tab-separated (Bill To \t Shipped To), take last part
+    // Shipped To / Ship To — use first line only; PDF text order can make greedy (.+) span the whole file.
+    const shipToLineMatch = text.match(
+      /(?:Shipped To|Ship To)\s*:\s*([^\n\r]+)/im,
+    );
+    let shippedTo = shipToLineMatch ? shipToLineMatch[1].trim() : '';
     if (shippedTo.includes('\t')) {
       shippedTo = shippedTo.split('\t').pop()?.trim() || shippedTo;
     }
 
-    // Extract CPC code like CPC-MUM5, CPC-PUNE3, HYD3, etc.
-    const cpcMatch = shippedTo.match(/\(([A-Z]+-[A-Z0-9]+|[A-Z]+\d+)\)/i);
-    const shippingLocation = cpcMatch ? cpcMatch[1] : shippedTo;
+    // Extract hub code like CPC-MUM5, HYD3 from parentheses
+    const cpcMatch = shippedTo.match(/\(([A-Z]+-[A-Z0-9]+|[A-Z]{2,}\d+[A-Z]?)\)/i);
+    const shippingLocation =
+      billToHubCode || (cpcMatch ? cpcMatch[1] : shippedTo);
 
     // Shipping address
-    const shipAddrMatch = text.match(/Shipped To\s*:[\s\S]*?Address\s*:\s*([\s\S]*?)(?:State|Phone|GSTIN)/i);
+    const shipAddrMatch = text.match(
+      /(?:Shipped To|Ship To)\s*:[\s\S]*?Address\s*:\s*([\s\S]*?)(?:State|Phone|GSTIN)/i,
+    );
     const shippingAddress = shipAddrMatch
       ? shipAddrMatch[1].replace(/\n/g, ', ').replace(/\s+/g, ' ').trim()
       : undefined;
@@ -277,8 +319,10 @@ export class PdfExtractionService {
       ? parseFloat(totalMatch[1].replace(/,/g, ''))
       : undefined;
 
-    // Line items: "155482 BH-dr Good... 04071100 - - 241 175.5 Per piece 0 0 42295.5"
-    const lineItems = this.extractHyperpureLineItems(text);
+    // Full PO vs PO SCHEDULE: schedule rows are Product No | Name | HSN | Scheduled Qty (no prices).
+    const lineItems = this.isHyperpurePoSchedule(text)
+      ? this.extractHyperpureScheduleLineItems(text)
+      : this.extractHyperpureLineItems(text);
 
     return {
       vendorName,
@@ -326,6 +370,77 @@ export class PdfExtractionService {
           quantity: parseInt(itemMatch[3], 10),
           price: parseFloat(itemMatch[4]),
           total: parseFloat(itemMatch[5]),
+        });
+      }
+    }
+
+    return items;
+  }
+
+  /** Hyperpure "PO SCHEDULE" attachment: tabular scheduled qty only (no unit prices in body). */
+  private isHyperpurePoSchedule(text: string): boolean {
+    return /PO\s*SCHEDULE/i.test(text) && /Scheduled\s*Qty/i.test(text);
+  }
+
+  /**
+   * Line items from PO SCHEDULE table: Product No., ProductName, HSN, Scheduled Qty.
+   * Prices are absent — set to 0 so validation/pricing can fill from NECC rules.
+   */
+  private extractHyperpureScheduleLineItems(text: string): ExtractedLineItem[] {
+    const items: ExtractedLineItem[] = [];
+    const lines = text.split('\n');
+    let inTable = false;
+
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      if (/Product\s*No\.?\b/i.test(line) && /Scheduled\s*Qty/i.test(line)) {
+        inTable = true;
+        continue;
+      }
+      if (!inTable) continue;
+
+      if (
+        /^Vendor\s+Id\b/i.test(line) ||
+        /^ZOMATO\s+HYPERPURE/i.test(line) ||
+        /^Registered\s+Address/i.test(line)
+      ) {
+        break;
+      }
+
+      const parts = line.split(/\t+/).map((p) => p.trim()).filter(Boolean);
+      if (parts.length >= 4) {
+        const qtyStr = parts[parts.length - 1].replace(/,/g, '');
+        const hsn = parts[parts.length - 2];
+        const code = parts[0];
+        const name = parts.slice(1, parts.length - 2).join(' ').trim();
+        const qty = parseInt(qtyStr, 10);
+        if (!/^\d{5,6}$/.test(code) || !/^\d{8}$/.test(hsn) || !Number.isFinite(qty) || qty < 0) {
+          continue;
+        }
+        items.push({
+          skuCode: code,
+          skuName: name,
+          hsnCode: hsn,
+          quantity: qty,
+          price: 0,
+          total: 0,
+        });
+        continue;
+      }
+
+      // Fallback: single-space-separated row (rare after pdf-parse)
+      const m = line.match(/^(\d{5,6})\s+(.+?)\s+(\d{8})\s+([\d,]+)\s*$/);
+      if (m) {
+        const qty = parseInt(m[4].replace(/,/g, ''), 10);
+        items.push({
+          skuCode: m[1],
+          skuName: m[2].replace(/\s+/g, ' ').trim(),
+          hsnCode: m[3],
+          quantity: qty,
+          price: 0,
+          total: 0,
         });
       }
     }

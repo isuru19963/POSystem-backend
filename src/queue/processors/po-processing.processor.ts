@@ -472,9 +472,13 @@ export class PoProcessingProcessor extends WorkerHost {
    * E.g., "MOONSTONE - 49336910000615_20260411_045623" (sender = Swiggy/MOONSTONE)
    */
   private extractVendorFromSubject(subject: string, from: string): string {
-    // Hyperpure: "VENDOR NAME - Hyperpure PO Number ..."
+    // Hyperpure: "ZOMATO HYPERPURE PVT LTD - Hyperpure PO Number CPCTG27-PO-…"
+    // Use the supplier segment before " - Hyperpure", not the platform name.
     const hyperpureMatch = subject.match(/^(.+?)\s*-\s*Hyperpure\s+PO/i);
-    if (hyperpureMatch) return 'Hyperpure';
+    if (hyperpureMatch) {
+      const fromSubject = hyperpureMatch[1].trim();
+      if (fromSubject.length > 0) return fromSubject;
+    }
 
     // Zepto: "Purchase Order P#### | VENDOR NAME | ..."
     if (/Purchase\s*Order\s*P\d+/i.test(subject)) return 'Zepto';
@@ -498,8 +502,19 @@ export class PoProcessingProcessor extends WorkerHost {
     xlsData: PdfExtractionResult,
     pdfData: PdfExtractionResult,
   ): PdfExtractionResult {
+    const xlsVendor = xlsData.vendorName?.trim();
+    const pdfVendor = pdfData.vendorName?.trim();
+    // XLS often labels the buyer as "Hyperpure" while the PDF has the legal entity name.
+    const xlsVendorIsImprecise =
+      !xlsVendor ||
+      /^hyperpure$/i.test(xlsVendor) ||
+      /^(buyer|customer|vendor)$/i.test(xlsVendor);
+    const vendorName = xlsVendorIsImprecise
+      ? pdfVendor || xlsVendor || ''
+      : xlsVendor || pdfVendor || '';
+
     return {
-      vendorName: xlsData.vendorName || pdfData.vendorName,
+      vendorName,
       vendorCode: xlsData.vendorCode || pdfData.vendorCode,
       vendorGstin: xlsData.vendorGstin || pdfData.vendorGstin,
       vendorAddress: xlsData.vendorAddress || pdfData.vendorAddress,

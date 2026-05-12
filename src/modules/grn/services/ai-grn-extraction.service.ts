@@ -29,7 +29,7 @@ export class AiGrnExtractionService {
 
   async extractFromText(rawText: string): Promise<AiGrnExtractionResult | null> {
     const apiKey = process.env.GEMINI_API_KEY;
-    const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash-lite';
+    const model = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
     if (!apiKey) return null;
 
     try {
@@ -43,6 +43,8 @@ export class AiGrnExtractionService {
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
             temperature: 0,
+            topP: 0.95,
+            maxOutputTokens: 8192,
             responseMimeType: 'application/json',
           },
         }),
