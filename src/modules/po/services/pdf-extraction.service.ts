@@ -101,6 +101,14 @@ export class PdfExtractionService {
       }
     }
 
+    if (this.isGarbageVendorLabel(result.vendorName)) {
+      this.logger.warn(
+        `Discarding garbage vendor name after extraction: ${JSON.stringify(result.vendorName)}`,
+      );
+      result.vendorName = '';
+      result.confidence = this.computeConfidence(result);
+    }
+
     this.logger.log(
       `Extracted PO ${result.poNumber} with ${result.lineItems.length} line items (confidence=${result.confidence?.toFixed(2)}, method=${result.extractionMethod})`,
     );
@@ -110,6 +118,7 @@ export class PdfExtractionService {
   private shouldUseAiFallback(result: PdfExtractionResult): boolean {
     if (!this.aiPoExtractionService.isEnabled()) return false;
     if (!result.poNumber || !result.poDate || !result.vendorName) return true;
+    if (this.isGarbageVendorLabel(result.vendorName)) return true;
     if (!result.shippingLocation) return true;
     if (!result.lineItems || result.lineItems.length === 0) return true;
     return (result.confidence || 0) < 0.72;
@@ -119,7 +128,12 @@ export class PdfExtractionService {
     let score = 0;
     if (result.poNumber) score += 0.25;
     if (result.poDate) score += 0.15;
-    if (result.vendorName) score += 0.15;
+    if (
+      result.vendorName &&
+      !this.isGarbageVendorLabel(result.vendorName)
+    ) {
+      score += 0.15;
+    }
     if (result.shippingLocation) score += 0.10;
     if (result.lineItems?.length) {
       score += result.lineItems.length >= 2 ? 0.25 : 0.15;
@@ -169,7 +183,10 @@ export class PdfExtractionService {
 
     const merged: PdfExtractionResult = {
       ...ruleResult,
-      vendorName: ruleResult.vendorName || aiResult.vendorName || '',
+      // Prefer a usable AI buyer name over a truthy but junk rule label (e.g. "PO No : …").
+      vendorName:
+        this.pickCounterpartyName(aiResult.vendorName, ruleResult.vendorName) ||
+        '',
       vendorCode: ruleResult.vendorCode || aiResult.vendorCode,
       vendorGstin: ruleResult.vendorGstin || aiResult.vendorGstin,
       poNumber: ruleResult.poNumber || aiResult.poNumber || '',
@@ -821,7 +838,10 @@ export class PdfExtractionService {
 
   /** Labels and junk that pdf-parse sometimes puts where a company name should be. */
   private isGarbageVendorLabel(name: string): boolean {
-    const t = name.trim();
+    const t = name
+      .trim()
+      .replace(/\uFF1A/g, ':')
+      .replace(/\u00A0/g, ' ');
     if (t.length < 2) return true;
     if (/^PO\s*No\.?\s*:/i.test(t)) return true;
     if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;

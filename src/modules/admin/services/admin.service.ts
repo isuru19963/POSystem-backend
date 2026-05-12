@@ -646,7 +646,10 @@ export class AdminService {
 
   /** Mirrors PdfExtractionService garbage checks for customer display strings. */
   private isGarbageCustomerLabel(name: string): boolean {
-    const t = name.trim();
+    const t = name
+      .trim()
+      .replace(/\uFF1A/g, ':')
+      .replace(/\u00A0/g, ' ');
     if (t.length < 2) return true;
     if (/^PO\s*No\.?\s*:/i.test(t)) return true;
     if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;

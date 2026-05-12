@@ -158,12 +158,19 @@ export class AiPoExtractionService {
         }))
       : [];
 
-    const junkVendor = (v: string) =>
-      /^PO\s*No\.?\s*:/i.test(v) ||
-      /^PO\s*No\.?\s*:?\s*$/i.test(v) ||
-      /^P\.?O\.?\s*Number\s*:?\s*$/i.test(v) ||
-      /^Address\s*:?\s*$/i.test(v) ||
-      /^Vendor\s*Name\s*:?\s*$/i.test(v);
+    const junkVendor = (v: string) => {
+      const t = v
+        .trim()
+        .replace(/\uFF1A/g, ':')
+        .replace(/\u00A0/g, ' ');
+      return (
+        /^PO\s*No\.?\s*:/i.test(t) ||
+        /^PO\s*No\.?\s*:?\s*$/i.test(t) ||
+        /^P\.?O\.?\s*Number\s*:?\s*$/i.test(t) ||
+        /^Address\s*:?\s*$/i.test(t) ||
+        /^Vendor\s*Name\s*:?\s*$/i.test(t)
+      );
+    };
 
     return {
       vendorName: (() => {
