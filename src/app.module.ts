@@ -63,6 +63,7 @@ import { BlinkitModule } from './modules/blinkit/blinkit.module';
 
 // Queue
 import { QueueModule } from './queue/queue.module';
+import { MetaModule } from './meta/meta.module';
 
 @Module({
   imports: [
@@ -163,6 +164,8 @@ import { QueueModule } from './queue/queue.module';
 
     // Queue Workers
     QueueModule,
+
+    MetaModule,
   ],
 })
 export class AppModule {}
