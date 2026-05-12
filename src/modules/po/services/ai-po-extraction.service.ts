@@ -159,6 +159,7 @@ export class AiPoExtractionService {
       : [];
 
     const junkVendor = (v: string) =>
+      /^PO\s*No\.?\s*:/i.test(v) ||
       /^PO\s*No\.?\s*:?\s*$/i.test(v) ||
       /^P\.?O\.?\s*Number\s*:?\s*$/i.test(v) ||
       /^Address\s*:?\s*$/i.test(v) ||

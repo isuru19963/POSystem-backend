@@ -574,36 +574,51 @@ export class PdfExtractionService {
 
   /** Extract the first company name from the Billing Address block */
   private extractBillingAddressCompany(text: string): string {
+    const tryLine = (raw: string): string | undefined => {
+      const t = raw.trim();
+      if (!t || this.isGarbageVendorLabel(t)) return undefined;
+      const inline = t.match(/^Address\s*:\s*(.+)$/i);
+      const body = (inline?.[1] ?? t).trim();
+      if (!body || this.isGarbageVendorLabel(body)) return undefined;
+      return body;
+    };
+
     // Text after "Billing Address" up to the next major section
     const billingMatch = text.match(/Billing\s*Address[\s\S]*?Address\s*:\s*([^\n]+)/i);
     if (billingMatch) {
-      const firstLine = billingMatch[1].trim();
-      if (
-        firstLine &&
-        firstLine.length > 2 &&
-        !this.isGarbageVendorLabel(firstLine)
-      ) {
-        return firstLine;
-      }
+      const hit = tryLine(billingMatch[1]);
+      if (hit) return hit;
     }
-    // Fallback: look for a line right after "Billing Address" header
+
     const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
     for (let i = 0; i < lines.length; i++) {
-      if (/Billing\s*Address/i.test(lines[i])) {
-        for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
-          const line = lines[j];
-          if (
-            line &&
-            !/^Address\s*:/i.test(line) &&
-            !/^GSTIN\s*:/i.test(line) &&
-            !/^PAN\s*:/i.test(line) &&
-            !/^Shipping\s*Address/i.test(line) &&
-            !this.isGarbageVendorLabel(line) &&
-            line.length > 4
-          ) {
-            return line;
+      if (!/Billing\s*Address/i.test(lines[i])) continue;
+      for (let j = i + 1; j < Math.min(i + 22, lines.length); j++) {
+        const raw = lines[j];
+        if (!raw || /^Shipping\s*Address/i.test(raw)) break;
+
+        if (/^Address\s*:/i.test(raw)) {
+          const fromSame = tryLine(raw);
+          if (fromSame) return fromSame;
+          // "Address :" alone — company name is often on the next line (Cloudstore PDFs).
+          if (j + 1 < lines.length) {
+            const nextHit = tryLine(lines[j + 1]);
+            if (nextHit) return nextHit;
           }
+          continue;
         }
+
+        if (
+          /^GSTIN\s*:/i.test(raw) ||
+          /^PAN\s*:/i.test(raw) ||
+          /^Phone\s*:/i.test(raw) ||
+          /^Email\s*:/i.test(raw)
+        ) {
+          continue;
+        }
+
+        const hit = tryLine(raw);
+        if (hit && hit.length > 4) return hit;
       }
     }
     return '';
@@ -621,25 +636,43 @@ export class PdfExtractionService {
 
   /** Extract the company / counterparty name from the Shipping Address section. */
   private extractShippingAddressCompany(text: string): string {
+    const tryLine = (raw: string): string | undefined => {
+      const t = raw.trim();
+      if (!t || this.isGarbageVendorLabel(t)) return undefined;
+      const inline = t.match(/^Address\s*:\s*(.+)$/i);
+      const body = (inline?.[1] ?? t).trim();
+      if (!body || this.isGarbageVendorLabel(body)) return undefined;
+      return body;
+    };
+
     const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
     for (let i = 0; i < lines.length; i++) {
-      if (/Shipping\s*Address/i.test(lines[i])) {
-        for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
-          const line = lines[j];
-          if (
-            line &&
-            !/^Address\s*:/i.test(line) &&
-            !/^GSTIN\s*:/i.test(line) &&
-            !/^PAN\s*:/i.test(line) &&
-            !/^Phone\s*:/i.test(line) &&
-            !/^State\s*:/i.test(line) &&
-            !/^Billing\s*Address/i.test(line) &&
-            !this.isGarbageVendorLabel(line) &&
-            line.length > 4
-          ) {
-            return line;
+      if (!/Shipping\s*Address/i.test(lines[i])) continue;
+      for (let j = i + 1; j < Math.min(i + 22, lines.length); j++) {
+        const raw = lines[j];
+        if (!raw || /^Billing\s*Address/i.test(raw)) break;
+
+        if (/^Address\s*:/i.test(raw)) {
+          const fromSame = tryLine(raw);
+          if (fromSame) return fromSame;
+          if (j + 1 < lines.length) {
+            const nextHit = tryLine(lines[j + 1]);
+            if (nextHit) return nextHit;
           }
+          continue;
         }
+
+        if (
+          /^GSTIN\s*:/i.test(raw) ||
+          /^PAN\s*:/i.test(raw) ||
+          /^Phone\s*:/i.test(raw) ||
+          /^Email\s*:/i.test(raw)
+        ) {
+          continue;
+        }
+
+        const hit = tryLine(raw);
+        if (hit && hit.length > 4) return hit;
       }
     }
     return '';
@@ -790,7 +823,7 @@ export class PdfExtractionService {
   private isGarbageVendorLabel(name: string): boolean {
     const t = name.trim();
     if (t.length < 2) return true;
-    if (/^PO\s*No\.?\s*:?\s*$/i.test(t)) return true;
+    if (/^PO\s*No\.?\s*:/i.test(t)) return true;
     if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;
     if (/^P\.?O\.?\s*No\.?\s*:?\s*$/i.test(t)) return true;
     if (/^Purchase\s*Order\s*No\.?\s*:?\s*$/i.test(t)) return true;
