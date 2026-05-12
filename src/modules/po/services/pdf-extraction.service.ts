@@ -163,7 +163,14 @@ export class PdfExtractionService {
   }
 
   private detectFormat(text: string): string {
-    if (/hyperpure/i.test(text) && /Purchase Order Number/i.test(text)) {
+    // Classic Hyperpure PO uses "Purchase Order Number" on its own line; PO SCHEDULE
+    // PDFs use "Purchase Order No :" / "PO SCHEDULE" and delivery as "Scheduled Date".
+    if (
+      /hyperpure/i.test(text) &&
+      (/Purchase Order Number/i.test(text) ||
+        /Purchase Order No/i.test(text) ||
+        /PO\s*SCHEDULE/i.test(text))
+    ) {
       return 'hyperpure';
     }
     if (/P\.?O\.?\s*Number/i.test(text) && /Shipping\s*Spoc\s*Details/i.test(text)) {
@@ -192,9 +199,29 @@ export class PdfExtractionService {
       return '';
     };
 
-    const poNumber = getNextLineValue(/^Purchase Order Number$/i);
-    const poDate = getNextLineValue(/^Purchase Order Date$/i);
-    const expectedDeliveryDate = getNextLineValue(/^Expected Delivery Date$/i);
+    const poNumber =
+      getNextLineValue(/^Purchase Order Number$/i) ||
+      this.extractField(lines, /Purchase Order No\s*:\s*(\S+)/i) ||
+      '';
+
+    const poDate =
+      getNextLineValue(/^Purchase Order Date$/i) ||
+      this.extractField(lines, /Purchase Order Date\s*:\s*(.+)/i) ||
+      '';
+
+    // Full PO: label "Expected Delivery Date" on one line, value on the next.
+    // PO SCHEDULE: uses "Scheduled Date" (same semantics as delivery) — inline or next line.
+    const scheduledDate =
+      getNextLineValue(/^Scheduled Date\s*:?$/i) ||
+      this.extractField(
+        lines,
+        /Scheduled Date\s*:\s*(\d{1,2}\s+[A-Za-z]+\s+\d{4})/i,
+      );
+
+    const expectedDeliveryDate =
+      getNextLineValue(/^Expected Delivery Date$/i) ||
+      scheduledDate ||
+      this.extractField(lines, /Expected\s*Delivery\s*Date\s*:\s*(.+)/i);
 
     // Customer = "Bill To" company — label and value are on separate lines:
     // Line N:   "Bill To :       Shipped To :"

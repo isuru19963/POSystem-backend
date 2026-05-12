@@ -6,7 +6,16 @@ export default registerAs('email', () => ({
     port: parseInt(process.env.IMAP_PORT || '993', 10),
     user: process.env.IMAP_USER,
     password: process.env.IMAP_PASSWORD,
-    tls: process.env.IMAP_TLS === 'true',
+    /**
+     * Port 993 is TLS-wrapped IMAP. Treating “unset” as TLS off broke Gmail
+     * and most providers when IMAP_TLS was omitted from env.
+     */
+    tls:
+      process.env.IMAP_TLS === 'false' || process.env.IMAP_TLS === '0'
+        ? false
+        : true,
+    /** Skip Gmail X-GM-RAW and use RFC SEARCH SINCE/ALL (debug or odd setups). */
+    forceStandardSearch: process.env.IMAP_FORCE_STANDARD_SEARCH === 'true',
   },
   smtp: {
     host: process.env.SMTP_HOST,

@@ -29,15 +29,13 @@ export interface MonitorInboxSummary {
 }
 
 @Processor(QUEUE_NAMES.PO_PROCESSING, {
-  // IMAP scans + PDF/XLS extraction routinely run several minutes and can
-  // block the event loop in chunks longer than BullMQ's 30 s default. Without
-  // these overrides, slow inbox jobs get spuriously moved to "stalled" and
-  // (with `maxStalledCount = 1`) eventually failed despite making progress.
-  // 10-minute lock with 5-minute renew + stalled interval covers the worst
-  // observed IMAP `SINCE 21 days` + multi-attachment fetches on this mailbox.
-  lockDuration: 600_000,
-  lockRenewTime: 300_000,
-  stalledInterval: 600_000,
+  // IMAP attachment downloads against Gmail throttle to ~3 s per FETCH even at
+  // 8-way concurrency; a 200-mail SINCE 21d scan therefore runs ~60–90 min
+  // wall-clock. We need a lock that survives the full parse window so BullMQ
+  // doesn’t reclaim the job and the cron stays single-flight.
+  lockDuration: 2 * 60 * 60_000,   // 2 hours
+  lockRenewTime: 10 * 60_000,      // renew every 10 min
+  stalledInterval: 2 * 60 * 60_000,
   maxStalledCount: 0,
 })
 export class PoProcessingProcessor extends WorkerHost {
