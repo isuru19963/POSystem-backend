@@ -6,7 +6,7 @@ import {
   BadRequestException,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, DataSource, IsNull } from 'typeorm';
+import { Repository, DataSource, IsNull, QueryFailedError } from 'typeorm';
 import * as bcrypt from 'bcrypt';
 import {
   Vendor,
@@ -34,6 +34,7 @@ import { XlsExtractionService } from '../../po/services/xls-extraction.service';
 import { StorageService } from '../../../storage/storage.service';
 import { ValidationService } from '../../validation/services/validation.service';
 import { isOwnCompanyName } from '../../po/services/own-company';
+import { PoService } from '../../po/services/po.service';
 
 @Injectable()
 export class AdminService {
@@ -97,6 +98,7 @@ export class AdminService {
     private readonly pdfExtractionService: PdfExtractionService,
     private readonly xlsExtractionService: XlsExtractionService,
     private readonly validationService: ValidationService,
+    private readonly poService: PoService,
   ) {}
 
   async purgeAllPOs(): Promise<{ deleted: Record<string, number> }> {
@@ -721,17 +723,34 @@ export class AdminService {
       );
     }
 
-    const buffer = await this.storageService.getFile(s3Key);
+    let buffer: Buffer;
+    try {
+      buffer = await this.storageService.getFile(s3Key);
+    } catch (err) {
+      this.logger.error(`getFile failed for key=${s3Key}`, err as Error);
+      throw new BadRequestException(
+        `Could not download the stored file from S3 (${s3Key}). Check the key and IAM permissions, or re-upload the PO.`,
+      );
+    }
+
     let extracted: PdfExtractionResult;
     const lower = s3Key.toLowerCase();
-    if (lower.endsWith('.pdf')) {
-      extracted = await this.pdfExtractionService.extract(buffer);
-    } else if (/\.(xls|xlsx|csv)$/i.test(lower)) {
-      const base = s3Key.split('/').pop() || s3Key;
-      extracted = this.xlsExtractionService.extract(buffer, base);
-    } else {
+    try {
+      if (lower.endsWith('.pdf')) {
+        extracted = await this.pdfExtractionService.extract(buffer);
+      } else if (/\.(xls|xlsx|csv)$/i.test(lower)) {
+        const base = s3Key.split('/').pop() || s3Key;
+        extracted = this.xlsExtractionService.extract(buffer, base);
+      } else {
+        throw new BadRequestException(
+          `Unsupported stored file type for key ${s3Key}; expected .pdf, .xls, .xlsx, or .csv`,
+        );
+      }
+    } catch (err) {
+      if (err instanceof BadRequestException) throw err;
+      this.logger.error(`Re-extraction threw for ${trimmed}`, err as Error);
       throw new BadRequestException(
-        `Unsupported stored file type for key ${s3Key}; expected .pdf, .xls, .xlsx, or .csv`,
+        `Re-extraction failed: ${(err as Error)?.message ?? String(err)}`,
       );
     }
 
@@ -742,49 +761,154 @@ export class AdminService {
       );
     }
 
-    let vendor =
+    const codeCandidate = vendorName.replace(/\s+/g, '_').substring(0, 50) || `v_${vendorName.length}`;
+    let vendor: Vendor | null =
       (await this.vendorRepo.findOne({ where: { name: vendorName } })) ||
-      (await this.vendorRepo.findOne({ where: { code: vendorName } }));
+      (await this.vendorRepo.findOne({ where: { code: codeCandidate } }));
     if (!vendor) {
-      vendor = this.vendorRepo.create({
-        name: vendorName,
-        code: vendorName.replace(/\s+/g, '_').substring(0, 50),
-      });
-      vendor = await this.vendorRepo.save(vendor);
+      let createCode = codeCandidate;
+      for (let attempt = 0; attempt < 8; attempt++) {
+        try {
+          vendor = await this.vendorRepo.save(
+            this.vendorRepo.create({
+              name: vendorName,
+              code: createCode.substring(0, 50),
+            }),
+          );
+          break;
+        } catch (err) {
+          const pg = (err as { driverError?: { code?: string } })?.driverError?.code;
+          if (pg === '23505' || err instanceof QueryFailedError) {
+            createCode = `${codeCandidate}_${attempt + 1}`;
+            continue;
+          }
+          throw err;
+        }
+      }
+      if (!vendor) {
+        throw new ConflictException(
+          `Could not create vendor "${vendorName}" due to a database uniqueness conflict.`,
+        );
+      }
     }
 
     const shipLoc = extracted.shippingLocation?.trim() ?? '';
-    const repairedIds: string[] = [];
-    let firstPreviousVendorId = '';
-    let firstPreviousVendorName = '';
+    const previousVendorId = rowsToRepair[0].vendorId;
+    const previousVendorName = rowsToRepair[0].vendor?.name ?? '';
 
-    for (const row of rowsToRepair) {
-      const previousVendorId = row.vendorId;
-      const previousVendorName = row.vendor?.name ?? '';
-      if (!firstPreviousVendorId) {
-        firstPreviousVendorId = previousVendorId;
-        firstPreviousVendorName = previousVendorName;
-      }
-
-      row.vendorId = vendor.id;
-      if (shipLoc) {
-        row.shippingLocation = shipLoc;
-      }
+    const repairMeta = (row: PurchaseOrder) => {
+      const base =
+        row.extractedData && typeof row.extractedData === 'object'
+          ? { ...(row.extractedData as Record<string, unknown>) }
+          : {};
       row.extractedData = {
-        ...(row.extractedData ?? {}),
+        ...base,
         repairedCustomerFromSourceAt: new Date().toISOString(),
         repairedFromS3Key: s3Key,
         repairedExtractionVendorName: vendorName,
         repairedExtractionShippingLocation: extracted.shippingLocation ?? '',
       };
+      if (shipLoc) row.shippingLocation = shipLoc;
+    };
 
-      await this.poRepo.save(row);
+    /** Another row may already use (po_number, vendor_id) — unique index — e.g. duplicate imports. */
+    const winnerSibling = await this.poRepo.findOne({
+      where: { poNumber: trimmed, vendorId: vendor.id },
+      relations: ['vendor'],
+    });
+
+    if (winnerSibling) {
+      winnerSibling.rawFileKey = winnerSibling.rawFileKey || sourceRow.rawFileKey;
+      winnerSibling.rawXlsFileKey = winnerSibling.rawXlsFileKey || sourceRow.rawXlsFileKey;
+      repairMeta(winnerSibling);
+      await this.poRepo.save(winnerSibling);
+
+      for (const junk of rowsToRepair) {
+        if (junk.id === winnerSibling.id) continue;
+        const liN = await this.poLineItemRepo.count({ where: { purchaseOrderId: junk.id } });
+        const poJ = await this.poRepo.findOne({
+          where: { id: junk.id },
+          relations: ['deliveries', 'grns'],
+        });
+        if (
+          liN === 0 &&
+          (poJ?.deliveries?.length ?? 0) === 0 &&
+          (poJ?.grns?.length ?? 0) === 0
+        ) {
+          await this.poService.removeById(junk.id);
+          await this.createAuditLog(
+            userId,
+            'purchase_order',
+            junk.id,
+            'repair_customer_removed_duplicate',
+            { poNumber: junk.poNumber, keptPurchaseOrderId: winnerSibling.id },
+            {},
+          );
+        } else {
+          throw new ConflictException(
+            `This PO number already exists for "${vendorName}" on row ${winnerSibling.id}, but duplicate row ${junk.id} still has line items, deliveries, or GRNs and cannot be removed automatically.`,
+          );
+        }
+      }
+
+      await this.createAuditLog(userId, 'purchase_order', winnerSibling.id, 'repair_customer', {
+        poNumber: winnerSibling.poNumber,
+        previousVendorId,
+        previousVendorName,
+        newVendorId: vendor.id,
+        newVendorName: vendor.name,
+        shippingLocation: winnerSibling.shippingLocation,
+        mergedDuplicateJunkRows: true,
+      }, {});
+
+      try {
+        await this.validationService.validatePo(winnerSibling.id);
+      } catch (err) {
+        this.logger.warn(
+          `validatePo failed after customer repair for ${winnerSibling.poNumber}: ${(err as Error)?.message}`,
+        );
+      }
+
+      return {
+        purchaseOrderId: winnerSibling.id,
+        repairedPurchaseOrderIds: [winnerSibling.id],
+        poNumber: winnerSibling.poNumber,
+        previousVendorId,
+        previousVendorName,
+        newVendorId: vendor.id,
+        newVendorName: vendor.name,
+        shippingLocation: winnerSibling.shippingLocation,
+      };
+    }
+
+    const repairedIds: string[] = [];
+    for (const row of rowsToRepair) {
+      const prevId = row.vendorId;
+      const prevName = row.vendor?.name ?? '';
+
+      row.vendorId = vendor.id;
+      repairMeta(row);
+
+      try {
+        await this.poRepo.save(row);
+      } catch (err) {
+        const pg = (err as { driverError?: { code?: string; detail?: string } })?.driverError
+          ?.code;
+        if (pg === '23505') {
+          this.logger.error(`Unique violation saving PO ${row.id}`, err as Error);
+          throw new ConflictException(
+            `Cannot assign buyer "${vendorName}" to this PO: another row already has the same PO number and vendor (database unique index on po_number + vendor_id).`,
+          );
+        }
+        throw err;
+      }
+
       repairedIds.push(row.id);
 
       await this.createAuditLog(userId, 'purchase_order', row.id, 'repair_customer', {
         poNumber: row.poNumber,
-        previousVendorId,
-        previousVendorName,
+        previousVendorId: prevId,
+        previousVendorName: prevName,
         newVendorId: vendor.id,
         newVendorName: vendor.name,
         shippingLocation: row.shippingLocation,
@@ -800,13 +924,12 @@ export class AdminService {
     }
 
     const primary = rowsToRepair[0];
-
     return {
       purchaseOrderId: primary.id,
       repairedPurchaseOrderIds: repairedIds,
       poNumber: primary.poNumber,
-      previousVendorId: firstPreviousVendorId,
-      previousVendorName: firstPreviousVendorName,
+      previousVendorId,
+      previousVendorName,
       newVendorId: vendor.id,
       newVendorName: vendor.name,
       shippingLocation: primary.shippingLocation,
