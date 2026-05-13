@@ -57,6 +57,26 @@ export class ReportsController {
     return this.reportsService.getDispatchSummary(new Date(date));
   }
 
+  // ---- New report endpoints (date-range filtered) ----
+
+  @Get('city-po-amount')
+  cityPoAmount(@Query('from') from: string, @Query('to') to: string) {
+    return this.reportsService.getCityWisePoAmount(new Date(from), new Date(to));
+  }
+
+  @Get('product-wise')
+  productWise(@Query('from') from: string, @Query('to') to: string) {
+    return this.reportsService.getProductWise(new Date(from), new Date(to));
+  }
+
+  @Get('undelivered-returns')
+  undeliveredReturns(@Query('from') from: string, @Query('to') to: string) {
+    return this.reportsService.getUndeliveredAndReturns(
+      new Date(from),
+      new Date(to),
+    );
+  }
+
   // ---- CSV exports ----
 
   @Get('export/vendor-performance')
@@ -112,6 +132,45 @@ export class ReportsController {
       new Date(to),
     );
     this.sendCsv(res, data as unknown as Record<string, unknown>[], `necc-trends_${city}_${from}_${to}.csv`);
+  }
+
+  @Get('export/city-po-amount')
+  async exportCityPoAmount(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getCityWisePoAmount(
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data, `city-po-amount_${from}_${to}.csv`);
+  }
+
+  @Get('export/product-wise')
+  async exportProductWise(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getProductWise(
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data, `product-wise_${from}_${to}.csv`);
+  }
+
+  @Get('export/undelivered-returns')
+  async exportUndeliveredReturns(
+    @Query('from') from: string,
+    @Query('to') to: string,
+    @Res() res: Response,
+  ) {
+    const data = await this.reportsService.getUndeliveredAndReturns(
+      new Date(from),
+      new Date(to),
+    );
+    this.sendCsv(res, data.items, `undelivered-returns_${from}_${to}.csv`);
   }
 
   // ---- helpers ----

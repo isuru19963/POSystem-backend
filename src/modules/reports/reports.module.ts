@@ -1,12 +1,32 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
-import { PurchaseOrder, Delivery, NeccPrice, Vendor } from '../../database/entities';
+import {
+  PurchaseOrder,
+  PurchaseOrderLineItem,
+  Delivery,
+  DeliveryLineItem,
+  Grn,
+  GrnLineItem,
+  NeccPrice,
+  Vendor,
+  Sku,
+} from '../../database/entities';
 import { ReportsController } from './controllers/reports.controller';
 import { ReportsService } from './services/reports.service';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([PurchaseOrder, Delivery, NeccPrice, Vendor]),
+    TypeOrmModule.forFeature([
+      PurchaseOrder,
+      PurchaseOrderLineItem,
+      Delivery,
+      DeliveryLineItem,
+      Grn,
+      GrnLineItem,
+      NeccPrice,
+      Vendor,
+      Sku,
+    ]),
   ],
   controllers: [ReportsController],
   providers: [ReportsService],
