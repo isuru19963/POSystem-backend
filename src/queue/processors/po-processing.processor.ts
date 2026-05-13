@@ -213,8 +213,10 @@ export class PoProcessingProcessor extends WorkerHost {
         if (grn) {
           this.logger.log(`Created GRN ${grn.grnNumber} from email "${email.subject}"`);
           try {
+            const grnUrl = await this.storageService.getSignedUrl(grnKey, 24 * 60 * 60);
             await this.whatsappService.sendGroupAlert(
               `📋 *GRN from email*\nGRN#: ${grn.grnNumber}\nFile: ${grnPdf.filename}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+              { mediaUrls: grnUrl ? [grnUrl] : [] },
             );
           } catch (waErr) {
             this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);
@@ -394,13 +396,19 @@ export class PoProcessingProcessor extends WorkerHost {
       `Created PO ${finalPoNumber} with ${extracted.lineItems.length} line items from email`,
     );
 
-    // Notify via WhatsApp
+    // Notify via WhatsApp — attach the original PO PDF (preferred) or XLS so
+    // receivers can open the source document from the chat directly.
     try {
       const vendorDisplay = extracted.vendorName || 'Unknown vendor';
       const itemCount = extracted.lineItems.length;
       const location = extracted.shippingLocation || 'unknown location';
+      const mediaKey = pdfFileKey || xlsFileKey;
+      const mediaUrl = mediaKey
+        ? await this.storageService.getSignedUrl(mediaKey, 24 * 60 * 60)
+        : null;
       await this.whatsappService.sendGroupAlert(
         `📦 *New PO Received*\nPO#: ${finalPoNumber}\nVendor: ${vendorDisplay}\nItems: ${itemCount}\nShip to: ${location}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+        { mediaUrls: mediaUrl ? [mediaUrl] : [] },
       );
     } catch (waErr) {
       this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);

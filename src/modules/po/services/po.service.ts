@@ -17,6 +17,7 @@ import { QueryPoDto } from '../dto/query-po.dto';
 import { ExtractedLineItem } from './pdf-extraction.service';
 import { isOwnCompanyName } from './own-company';
 import { WhatsappService } from '../../../whatsapp/whatsapp.service';
+import { StorageService } from '../../../storage/storage.service';
 import { ValidationService } from '../../validation/services/validation.service';
 import { messageIdSearchVariants } from '../../../common/utils/email-message-id.util';
 
@@ -44,6 +45,7 @@ export class PoService {
     @InjectRepository(NotificationContact)
     private readonly notifContactRepo: Repository<NotificationContact>,
     private readonly whatsappService: WhatsappService,
+    private readonly storageService: StorageService,
     private readonly validationService: ValidationService,
   ) {}
 
@@ -427,11 +429,21 @@ export class PoService {
         .filter(Boolean)
         .join('\n');
 
+      // Prefer the original PDF; fall back to the XLS if no PDF was captured.
+      const mediaUrls: string[] = [];
+      const mediaKey = po.rawFileKey || po.rawXlsFileKey;
+      if (mediaKey) {
+        const signed = await this.storageService.getSignedUrl(mediaKey, 24 * 60 * 60);
+        if (signed) mediaUrls.push(signed);
+      }
+
       await Promise.all(
         contacts.map((c) =>
-          this.whatsappService.sendMessage(c.phone, message).catch((err) => {
-            this.logger.warn(`WhatsApp notify failed for ${c.phone}: ${err?.message}`);
-          }),
+          this.whatsappService
+            .sendMessage(c.phone, message, { mediaUrls })
+            .catch((err) => {
+              this.logger.warn(`WhatsApp notify failed for ${c.phone}: ${err?.message}`);
+            }),
         ),
       );
     } catch (err) {

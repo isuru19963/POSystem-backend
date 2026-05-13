@@ -5,6 +5,7 @@ import {
   PutObjectCommand,
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { Readable } from 'stream';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -83,5 +84,32 @@ export class StorageService {
       chunks.push(Buffer.from(chunk));
     }
     return Buffer.concat(chunks);
+  }
+
+  /**
+   * Generate a temporary, publicly accessible HTTPS URL for an S3 object.
+   * Used by Twilio WhatsApp media — Twilio needs an unauthenticated URL it
+   * can fetch within the link's lifetime. Returns null in local-storage mode
+   * (no S3 to sign against).
+   */
+  async getSignedUrl(key: string, expiresInSeconds = 3600): Promise<string | null> {
+    if (this.useLocal) {
+      this.logger.warn(
+        `getSignedUrl skipped — local storage mode (key=${key})`,
+      );
+      return null;
+    }
+    try {
+      return await getSignedUrl(
+        this.s3,
+        new GetObjectCommand({ Bucket: this.bucket, Key: key }),
+        { expiresIn: expiresInSeconds },
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Failed to sign S3 URL for ${key}: ${err instanceof Error ? err.message : err}`,
+      );
+      return null;
+    }
   }
 }

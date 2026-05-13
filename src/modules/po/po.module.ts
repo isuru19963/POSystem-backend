@@ -19,6 +19,7 @@ import { AiPoExtractionService } from './services/ai-po-extraction.service';
 import { QUEUE_NAMES } from '../../common/constants/app.constants';
 import { EmailModule } from '../../email/email.module';
 import { WhatsappModule } from '../../whatsapp/whatsapp.module';
+import { StorageModule } from '../../storage/storage.module';
 import { ValidationModule } from '../validation/validation.module';
 import { NotificationContact } from '../../database/entities';
 
@@ -38,6 +39,7 @@ import { NotificationContact } from '../../database/entities';
     BullModule.registerQueue({ name: QUEUE_NAMES.PO_PROCESSING }),
     EmailModule,
     WhatsappModule,
+    StorageModule,
     ValidationModule,
   ],
   controllers: [PoController],
