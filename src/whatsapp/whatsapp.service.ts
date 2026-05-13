@@ -6,6 +6,7 @@ import { Twilio } from 'twilio';
 export class WhatsappService {
   private readonly logger = new Logger(WhatsappService.name);
   private readonly client: Twilio;
+  /** Twilio WhatsApp sender (E.164), without the `whatsapp:` prefix */
   private readonly from: string;
 
   constructor(private readonly configService: ConfigService) {
@@ -13,21 +14,37 @@ export class WhatsappService {
       this.configService.get<string>('whatsapp.accountSid') || '',
       this.configService.get<string>('whatsapp.authToken') || '',
     );
-    this.from = this.configService.get<string>('whatsapp.from') || '';
+    const rawFrom = (this.configService.get<string>('whatsapp.from') || '').trim();
+    this.from = rawFrom.replace(/^whatsapp:/i, '');
+  }
+
+  /** E.164 for Twilio; strips accidental `whatsapp:` prefix from DB values. */
+  normalizeWhatsAppTo(to: string): string {
+    let t = (to || '').trim();
+    t = t.replace(/^whatsapp:/i, '');
+    return t;
   }
 
   async sendMessage(to: string, message: string): Promise<void> {
-    this.logger.log(`Sending WhatsApp message to ${to}`);
+    const toAddr = this.normalizeWhatsAppTo(to);
+    if (!this.from) {
+      throw new Error('TWILIO_WHATSAPP_FROM is not configured');
+    }
+    if (!toAddr) {
+      throw new Error('WhatsApp recipient number is empty');
+    }
+    this.logger.log(`Sending WhatsApp message to ${toAddr}`);
     await this.client.messages.create({
       from: `whatsapp:${this.from}`,
-      to: `whatsapp:${to}`,
+      to: `whatsapp:${toAddr}`,
       body: message,
     });
   }
 
   async sendGroupAlert(message: string): Promise<void> {
-    const groupId =
-      this.configService.get<string>('whatsapp.groupId') || '';
+    const groupId = this.normalizeWhatsAppTo(
+      this.configService.get<string>('whatsapp.groupId') || '',
+    );
     if (!groupId) {
       this.logger.warn('WhatsApp group ID not configured');
       return;

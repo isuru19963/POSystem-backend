@@ -14,7 +14,7 @@ export class OrdersDigestScheduler {
     try {
       const r = await this.ordersDigestService.sendTodaysOrdersDigest();
       this.logger.log(
-        `Today's Orders WhatsApp digest: sentTo=${r.sentTo} orderCount=${r.orderCount}`,
+        `Today's Orders WhatsApp digest: delivered=${r.delivered}/${r.attempted} orderCount=${r.orderCount}${r.failed ? ` failed=${r.failed}` : ''}`,
       );
     } catch (e) {
       this.logger.error(

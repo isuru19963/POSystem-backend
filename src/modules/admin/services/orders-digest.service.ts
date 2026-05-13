@@ -102,7 +102,14 @@ export class OrdersDigestService {
    * When there are zero matching POs, still sends a short message so recipients know the digest ran.
    */
   async sendTodaysOrdersDigest(): Promise<{
+    /** Successfully accepted by Twilio (one per contact that did not error). */
+    delivered: number;
+    /** Active contacts we tried to send to. */
+    attempted: number;
+    /** @deprecated Use `delivered`; kept for older clients (same as delivered). */
     sentTo: number;
+    failed: number;
+    failures?: Array<{ phone: string; error: string }>;
     orderCount: number;
     messageChars: number;
   }> {
@@ -124,7 +131,14 @@ export class OrdersDigestService {
       this.logger.warn(
         'Skipping Today\'s Orders digest — no active WhatsApp notification contacts',
       );
-      return { sentTo: 0, orderCount: 0, messageChars: 0 };
+      return {
+        delivered: 0,
+        attempted: 0,
+        sentTo: 0,
+        failed: 0,
+        orderCount: 0,
+        messageChars: 0,
+      };
     }
 
     const pos = await this.findTodaysOrders();
@@ -133,18 +147,30 @@ export class OrdersDigestService {
       `Today's Orders digest (${todayStr} IST): ${pos.length} PO(s) → ${contacts.length} contact(s)`,
     );
 
-    await Promise.all(
-      contacts.map((c) =>
-        this.whatsappService.sendMessage(c.phone, body).catch((err) => {
-          this.logger.warn(
-            `WhatsApp digest failed for ${c.phone}: ${err instanceof Error ? err.message : err}`,
-          );
-        }),
-      ),
+    const results = await Promise.all(
+      contacts.map(async (c) => {
+        try {
+          await this.whatsappService.sendMessage(c.phone, body);
+          return { ok: true as const, phone: c.phone };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.logger.warn(`WhatsApp digest failed for ${c.phone}: ${msg}`);
+          return { ok: false as const, phone: c.phone, error: msg };
+        }
+      }),
     );
 
+    const delivered = results.filter((r) => r.ok).length;
+    const failures = results
+      .filter((r): r is { ok: false; phone: string; error: string } => !r.ok)
+      .map((r) => ({ phone: r.phone, error: r.error }));
+
     return {
-      sentTo: contacts.length,
+      delivered,
+      attempted: contacts.length,
+      sentTo: delivered,
+      failed: failures.length,
+      failures: failures.length ? failures : undefined,
       orderCount: pos.length,
       messageChars: body.length,
     };
