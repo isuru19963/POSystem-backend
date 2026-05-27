@@ -1,4 +1,11 @@
-import { Entity, Column, ManyToOne, OneToMany, JoinColumn, Index } from 'typeorm';
+import {
+  Entity,
+  Column,
+  ManyToOne,
+  OneToMany,
+  JoinColumn,
+  Index,
+} from 'typeorm';
 import { BaseEntity } from './base.entity';
 import { Vendor } from './vendor.entity';
 import { PurchaseOrderLineItem } from './purchase-order-line-item.entity';
@@ -9,6 +16,14 @@ export enum PoStatus {
   RECEIVED = 'received',
   PROCESSING = 'processing',
   EXTRACTED = 'extracted',
+  /**
+   * PO was extracted but one or more line items could not be matched to an
+   * SKU in our master catalogue. Validation, consolidation, dispatch creation,
+   * and reporting are all blocked until every line item has been mapped to an
+   * SKU (either by adding the SKU in admin and re-matching, or by manually
+   * mapping each line item from the PO drawer).
+   */
+  NEEDS_SKU_MAPPING = 'needs_sku_mapping',
   VALIDATED = 'validated',
   PRICE_MISMATCH = 'price_mismatch',
   CONSOLIDATED = 'consolidated',
@@ -65,10 +80,18 @@ export class PurchaseOrder extends BaseEntity {
   @Column({ name: 'extracted_data', type: 'jsonb', nullable: true })
   extractedData?: Record<string, unknown>;
 
-  @Column({ name: 'total_amount', type: 'decimal', precision: 12, scale: 2, nullable: true })
+  @Column({
+    name: 'total_amount',
+    type: 'decimal',
+    precision: 12,
+    scale: 2,
+    nullable: true,
+  })
   totalAmount?: number;
 
-  @OneToMany(() => PurchaseOrderLineItem, (li) => li.purchaseOrder, { cascade: true })
+  @OneToMany(() => PurchaseOrderLineItem, (li) => li.purchaseOrder, {
+    cascade: true,
+  })
   lineItems!: PurchaseOrderLineItem[];
 
   @OneToMany(() => Delivery, (d) => d.purchaseOrder)

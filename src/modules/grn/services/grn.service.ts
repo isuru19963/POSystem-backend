@@ -1,6 +1,6 @@
 import { BadRequestException, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, ILike } from 'typeorm';
 import {
   Grn,
   GrnLineItem,
@@ -212,6 +212,64 @@ export class GrnService {
     });
   }
 
+  /**
+   * Match PO by number with common PDF/email variants (spaces, case, prefixes).
+   */
+  private async findPurchaseOrderForGrn(
+    poNumber: string,
+  ): Promise<PurchaseOrder | null> {
+    const trimmed = poNumber.trim();
+    if (!trimmed) return null;
+
+    const variants = new Set<string>([trimmed, trimmed.toUpperCase()]);
+    const compact = trimmed.replace(/\s+/g, '');
+    if (compact) variants.add(compact.toUpperCase());
+
+    const cloudstorePo = trimmed.match(
+      /\b((?:CFF|CMP|CVPL|CVP|HP)PO\d{4,}[A-Z0-9-]*)\b/i,
+    );
+    if (cloudstorePo?.[1]) {
+      variants.add(cloudstorePo[1].toUpperCase());
+    }
+
+    const poNumMatch = trimmed.match(
+      /\b((?:CFF|HP|PO|CVP|CVPL)?[-_]?\d{5,}[A-Z0-9-]*)\b/i,
+    );
+    if (poNumMatch?.[1]) {
+      variants.add(poNumMatch[1].toUpperCase());
+    }
+
+    for (const candidate of variants) {
+      const po = await this.poRepo.findOne({
+        where: { poNumber: ILike(candidate) },
+        relations: ['lineItems'],
+      });
+      if (po) return po;
+    }
+
+    return this.poRepo
+      .createQueryBuilder('po')
+      .leftJoinAndSelect('po.lineItems', 'lineItems')
+      .where('po.po_number ILIKE :q', { q: `%${compact || trimmed}%` })
+      .orderBy('po.created_at', 'DESC')
+      .getOne();
+  }
+
+  /** Quick PDF sniff — email subject/filename may not mention GRN. */
+  async pdfLooksLikeGrn(pdfBuffer: Buffer): Promise<boolean> {
+    return this.grnPdfService.looksLikeGrnDocument(pdfBuffer);
+  }
+
+  private normalizeDocNumber(raw?: string): string {
+    if (!raw) return '';
+    let t = String(raw).trim().replace(/[.,;:\-]+$/g, '');
+    const cloudstore = t.match(
+      /\b((?:CFF|CMP|CVPL|CVP|HP)PO\d{4,}[A-Z0-9-]*)\b/i,
+    );
+    if (cloudstore?.[1]) return cloudstore[1].toUpperCase();
+    return t;
+  }
+
   async findByEmailMessageId(messageId: string | undefined): Promise<Grn | null> {
     const variants = messageIdSearchVariants(messageId);
     if (!variants.length) return null;
@@ -226,6 +284,7 @@ export class GrnService {
    */
   async createFromEmailPdf(params: {
     emailMessageId?: string;
+    emailSubject?: string;
     rawFileKey?: string;
     pdfBuffer: Buffer;
   }): Promise<Grn | null> {
@@ -238,14 +297,65 @@ export class GrnService {
       }
     }
 
-    const extracted = await this.grnPdfService.extract(params.pdfBuffer);
-    const poNumber = extracted.poNumber?.trim();
-    const grnNumber = extracted.grnNumber?.trim();
+    let extracted = await this.grnPdfService.extract(params.pdfBuffer, {
+      emailSubject: params.emailSubject,
+    });
+    const poNumber = this.normalizeDocNumber(extracted.poNumber);
+    const grnNumber = this.normalizeDocNumber(extracted.grnNumber);
     if (!poNumber || !grnNumber) {
       throw new BadRequestException('GRN PDF is missing PO number or GRN number after extraction');
     }
+
+    const po = await this.findPurchaseOrderForGrn(poNumber);
+    if (!extracted.lineItems?.length && po?.lineItems?.length) {
+      const text = extracted.rawText ?? '';
+      const fromCatalog = this.grnPdfService.extractLineItemsFromPoCatalog(
+        text,
+        po.lineItems,
+      );
+      if (fromCatalog.length) {
+        this.logger.log(
+          `GRN ${grnNumber}: matched ${fromCatalog.length} line item(s) from PO ${poNumber} catalogue`,
+        );
+        extracted = { ...extracted, lineItems: fromCatalog };
+      }
+    }
+
+    if (!extracted.lineItems?.length && po?.lineItems?.length) {
+      const text = extracted.rawText ?? '';
+      const sniffed = this.grnPdfService.sniffLineItemsFromPoCatalog(
+        text,
+        po.lineItems,
+      );
+      if (sniffed.length) {
+        this.logger.log(
+          `GRN ${grnNumber}: sniffed ${sniffed.length} line item(s) from PDF text for PO ${poNumber}`,
+        );
+        extracted = { ...extracted, lineItems: sniffed };
+      }
+    }
+
+    let importNote: string | undefined;
+    if (!extracted.lineItems?.length && po?.lineItems?.length) {
+      const fallback = this.grnPdfService.buildFallbackLineItemsFromPo(
+        po.lineItems,
+      );
+      if (fallback.length) {
+        this.logger.warn(
+          `GRN ${grnNumber}: using ${fallback.length} PO line(s) as placeholder — PDF had no parseable quantities`,
+        );
+        extracted = { ...extracted, lineItems: fallback };
+        importNote =
+          'Imported from email; line quantities could not be read from PDF — please review and update received/accepted qty.';
+      }
+    }
+
     if (!extracted.lineItems?.length) {
-      throw new BadRequestException('GRN PDF has no line items after extraction');
+      throw new BadRequestException(
+        po
+          ? 'GRN PDF has no line items after extraction — check the PDF format or re-import the PO'
+          : `PO "${poNumber}" not found — import POs from email first (PO List → Fetch from Email), then fetch GRNs again`,
+      );
     }
 
     const existingNum = await this.grnRepo.findOne({ where: { grnNumber } });
@@ -265,7 +375,7 @@ export class GrnService {
       }
     }
 
-    return this.createGrnManual({
+    const grn = await this.createGrnManual({
       poNumber,
       grnNumber,
       grnDate: grnDateIso,
@@ -273,10 +383,15 @@ export class GrnService {
       emailMessageId: msgId,
       rawFileKey: params.rawFileKey,
     });
+    if (importNote) {
+      await this.grnRepo.update(grn.id, { notes: importNote });
+      grn.notes = importNote;
+    }
+    return grn;
   }
 
   private mapExtractedLineToManual(li: GrnExtractedLineItem): ManualGrnLineItemDto {
-    const accepted = Math.max(0, Math.round(Number(li.acceptedQty) || 0));
+    let accepted = Math.max(0, Math.round(Number(li.acceptedQty) || 0));
     const r = Number(li.receivedQty);
     const j = Number(li.rejectedQty);
     const hasReceived = Number.isFinite(r);
@@ -287,6 +402,9 @@ export class GrnService {
 
     if (!hasReceived && hasRejected) {
       receivedQuantity = accepted + rejectedQuantity;
+    }
+    if (accepted === 0 && receivedQuantity > 0) {
+      accepted = Math.max(0, receivedQuantity - rejectedQuantity);
     }
 
     return {
@@ -311,11 +429,12 @@ export class GrnService {
       }
     }
 
-    const po = await this.poRepo.findOne({
-      where: { poNumber: dto.poNumber },
-      relations: ['lineItems'],
-    });
-    if (!po) throw new NotFoundException(`PO ${dto.poNumber} not found`);
+    const po = await this.findPurchaseOrderForGrn(dto.poNumber);
+    if (!po) {
+      throw new NotFoundException(
+        `PO "${dto.poNumber}" not found — import the PO first, then fetch GRNs again`,
+      );
+    }
 
     // Guard against duplicate GRN number
     const existing = await this.grnRepo.findOne({ where: { grnNumber: dto.grnNumber } });
@@ -329,7 +448,12 @@ export class GrnService {
       emailMessageId: dto.emailMessageId?.trim() || undefined,
       rawFileKey: dto.rawFileKey,
       lineItems: dto.lineItems.map((li) => {
-        const poItem = po.lineItems.find((p) => p.itemCode === li.itemCode);
+        const code = li.itemCode.trim();
+        const poItem =
+          po.lineItems.find((p) => p.itemCode === code) ||
+          po.lineItems.find(
+            (p) => p.itemCode?.toUpperCase() === code.toUpperCase(),
+          );
         return this.grnLineItemRepo.create({
           skuId: poItem?.skuId,
           itemCode: li.itemCode,

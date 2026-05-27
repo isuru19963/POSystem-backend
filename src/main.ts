@@ -15,10 +15,13 @@ async function bootstrap() {
   // Global prefix
   app.setGlobalPrefix('api/v1');
 
-  // CORS
+  // CORS — allow the static S3 site; credentials require a concrete origin (not *).
+  const corsOrigin =
+    process.env.CORS_ORIGIN ||
+    'http://posystem-frontend.s3-website-us-east-1.amazonaws.com';
   app.enableCors({
-    origin: process.env.CORS_ORIGIN || '*',
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
+    origin: corsOrigin.split(',').map((o) => o.trim()),
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });
 

@@ -88,7 +88,8 @@ export class ReportsService {
         deliveredPos,
         totalAmount: num(r.totalAmount),
         avgAmount: num(r.avgAmount),
-        accuracyPercent: totalPos > 0 ? +((validPos / totalPos) * 100).toFixed(2) : 0,
+        accuracyPercent:
+          totalPos > 0 ? +((validPos / totalPos) * 100).toFixed(2) : 0,
         fulfillmentPercent:
           totalPos > 0 ? +((deliveredPos / totalPos) * 100).toFixed(2) : 0,
       };
@@ -129,9 +130,10 @@ export class ReportsService {
    * Per-product (PO line items) breakdown — total ordered quantity, total PO
    * value, average price and number of distinct POs containing the item.
    *
-   * SKU is matched via the line_items.sku_id join when available; falls back
-   * to `item_code` so unmapped products are still reported (under their PO
-   * item code).
+   * SKU mapping is mandatory: only line items joined to a master SKU are
+   * included. Anything still sitting under a vendor-given item code is
+   * skipped, since a PO with unmapped items is held in NEEDS_SKU_MAPPING
+   * status and shouldn't be feeding into reports.
    */
   async getProductWise(
     fromDate: Date,
@@ -139,8 +141,8 @@ export class ReportsService {
   ): Promise<Record<string, unknown>[]> {
     const rows = await this.poLineItemRepo
       .createQueryBuilder('li')
-      .select(`COALESCE(s.code, li.item_code, 'UNKNOWN')`, 'productCode')
-      .addSelect(`COALESCE(s.name, li.item_name, 'Unnamed')`, 'productName')
+      .select('s.code', 'productCode')
+      .addSelect('s.name', 'productName')
       .addSelect('s.brand', 'brand')
       .addSelect('s.pack_size', 'packSize')
       .addSelect('COUNT(DISTINCT po.id)', 'poCount')
@@ -148,12 +150,10 @@ export class ReportsService {
       .addSelect('COALESCE(SUM(li.quantity * li.po_price), 0)', 'totalAmount')
       .addSelect('COALESCE(AVG(li.po_price), 0)', 'avgPrice')
       .innerJoin('purchase_orders', 'po', 'po.id = li.purchase_order_id')
-      .leftJoin('skus', 's', 's.id = li.sku_id')
+      .innerJoin('skus', 's', 's.id = li.sku_id')
       .where('po.po_date BETWEEN :fromDate AND :toDate', { fromDate, toDate })
       .groupBy('s.code')
-      .addGroupBy('li.item_code')
       .addGroupBy('s.name')
-      .addGroupBy('li.item_name')
       .addGroupBy('s.brand')
       .addGroupBy('s.pack_size')
       .orderBy('"totalAmount"', 'DESC')
@@ -193,8 +193,8 @@ export class ReportsService {
   }> {
     const rows = await this.poLineItemRepo
       .createQueryBuilder('li')
-      .select(`COALESCE(s.code, li.item_code, 'UNKNOWN')`, 'productCode')
-      .addSelect(`COALESCE(s.name, li.item_name, 'Unnamed')`, 'productName')
+      .select('s.code', 'productCode')
+      .addSelect('s.name', 'productName')
       .addSelect('COALESCE(SUM(li.quantity), 0)', 'orderedQty')
       .addSelect('COALESCE(AVG(li.po_price), 0)', 'avgPoPrice')
       // GRN aggregates per PO line item (matched by item_code within the PO)
@@ -229,12 +229,13 @@ export class ReportsService {
         'rejectedQty',
       )
       .innerJoin('purchase_orders', 'po', 'po.id = li.purchase_order_id')
-      .leftJoin('skus', 's', 's.id = li.sku_id')
+      // Only count line items that are mapped to a master SKU; unmapped
+      // line items live on POs in NEEDS_SKU_MAPPING and are excluded from
+      // reports until they're mapped.
+      .innerJoin('skus', 's', 's.id = li.sku_id')
       .where('po.po_date BETWEEN :fromDate AND :toDate', { fromDate, toDate })
       .groupBy('s.code')
-      .addGroupBy('li.item_code')
       .addGroupBy('s.name')
-      .addGroupBy('li.item_name')
       .addGroupBy('li.purchase_order_id')
       .getRawMany();
 
@@ -301,11 +302,16 @@ export class ReportsService {
         shortageValue,
         returnsValue,
         fulfillmentPercent:
-          p.orderedQty > 0 ? +((p.receivedQty / p.orderedQty) * 100).toFixed(2) : 0,
+          p.orderedQty > 0
+            ? +((p.receivedQty / p.orderedQty) * 100).toFixed(2)
+            : 0,
       };
     });
 
-    items.sort((a, b) => b.shortageValue + b.returnsValue - (a.shortageValue + a.returnsValue));
+    items.sort(
+      (a, b) =>
+        b.shortageValue + b.returnsValue - (a.shortageValue + a.returnsValue),
+    );
 
     const summary = items.reduce(
       (acc, x) => ({
@@ -314,7 +320,9 @@ export class ReportsService {
         totalReceivedQty: acc.totalReceivedQty + x.receivedQty,
         totalShortageQty: acc.totalShortageQty + x.shortageQty,
         totalRejectedQty: acc.totalRejectedQty + x.rejectedQty,
-        totalShortageValue: +(acc.totalShortageValue + x.shortageValue).toFixed(2),
+        totalShortageValue: +(acc.totalShortageValue + x.shortageValue).toFixed(
+          2,
+        ),
         totalReturnsValue: +(acc.totalReturnsValue + x.returnsValue).toFixed(2),
       }),
       {
@@ -343,7 +351,11 @@ export class ReportsService {
       .addSelect('s.name', 'skuName')
       .addSelect('SUM(li.quantity)', 'totalQuantity')
       .addSelect('AVG(li.po_price)', 'avgPrice')
-      .innerJoin('purchase_order_line_items', 'li', 'li.purchase_order_id = po.id')
+      .innerJoin(
+        'purchase_order_line_items',
+        'li',
+        'li.purchase_order_id = po.id',
+      )
       .innerJoin('skus', 's', 's.id = li.sku_id')
       .where('po.po_date BETWEEN :fromDate AND :toDate', { fromDate, toDate })
       .groupBy('po.shipping_location')
@@ -369,12 +381,42 @@ export class ReportsService {
       where: { poDate: Between(fromDate, toDate), status: 'completed' as any },
     });
 
+    const mismatches = await this.poRepo.count({
+      where: {
+        poDate: Between(fromDate, toDate),
+        status: 'price_mismatch' as any,
+      },
+    });
+
     return {
       totalOrders: total,
       delivered,
       completed,
+      mismatches,
       fulfillmentRate: total > 0 ? ((delivered + completed) / total) * 100 : 0,
     };
+  }
+
+  /** Daily PO count and total amount for dashboard order-trend chart. */
+  async getOrderTrend(
+    fromDate: Date,
+    toDate: Date,
+  ): Promise<Record<string, unknown>[]> {
+    const rows = await this.poRepo
+      .createQueryBuilder('po')
+      .select('DATE(po.po_date)', 'day')
+      .addSelect('COUNT(po.id)', 'orders')
+      .addSelect('COALESCE(SUM(po.total_amount), 0)', 'value')
+      .where('po.po_date BETWEEN :fromDate AND :toDate', { fromDate, toDate })
+      .groupBy('DATE(po.po_date)')
+      .orderBy('day', 'ASC')
+      .getRawMany();
+
+    return rows.map((r) => ({
+      day: r.day,
+      orders: num(r.orders),
+      value: num(r.value),
+    }));
   }
 
   async getNeccTrends(

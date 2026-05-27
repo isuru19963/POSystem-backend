@@ -14,6 +14,8 @@ import {
 import { AuthGuard } from '@nestjs/passport';
 import { AdminService } from '../services/admin.service';
 import { OrdersDigestService } from '../services/orders-digest.service';
+import { WhatsappService } from '../../../whatsapp/whatsapp.service';
+import type { WhatsAppTemplatePurpose } from '../../../whatsapp/whatsapp-template.types';
 import { RolesGuard } from '../../auth/guards/roles.guard';
 import { Roles } from '../../../common/decorators/roles.decorator';
 import { UserRole } from '../../../database/entities';
@@ -41,6 +43,7 @@ export class AdminController {
   constructor(
     private readonly adminService: AdminService,
     private readonly ordersDigestService: OrdersDigestService,
+    private readonly whatsappService: WhatsappService,
   ) {}
 
   // --- Vendors ---
@@ -81,6 +84,12 @@ export class AdminController {
   @Delete('vendors/:id')
   deleteVendor(@Param('id', ParseUUIDPipe) id: string) {
     return this.adminService.deleteVendor(id, 'system');
+  }
+
+  /** Strip "Buyer Name:" labels, remove "PO No :" rows, merge duplicate customers. */
+  @Post('vendors/repair-display-names')
+  repairVendorDisplayNames() {
+    return this.adminService.repairVendorDisplayNames('system');
   }
 
   /** Add default pricing rules (all 3 brands) for every vendor missing a catch-all rule. */
@@ -360,5 +369,30 @@ export class AdminController {
   @Post('notification-contacts/send-todays-digest')
   sendTodaysOrdersDigest() {
     return this.ordersDigestService.sendTodaysOrdersDigest();
+  }
+
+  // --- WhatsApp approved templates (24h-window bypass) ---
+  @Get('whatsapp/templates')
+  getWhatsAppTemplateStatus() {
+    return this.whatsappService.getTemplateConfigStatus();
+  }
+
+  @Post('whatsapp/templates/test')
+  testWhatsAppTemplate(
+    @Body()
+    body: {
+      phone: string;
+      purpose?: WhatsAppTemplatePurpose;
+      summary?: string;
+      detail?: string;
+    },
+  ) {
+    const purpose = body.purpose ?? 'generic';
+    return this.whatsappService.testTemplateSend(
+      body.phone,
+      purpose,
+      body.summary,
+      body.detail,
+    );
   }
 }

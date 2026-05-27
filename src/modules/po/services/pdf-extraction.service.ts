@@ -1,6 +1,11 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AiPoExtractionService, AiPoExtractionResult } from './ai-po-extraction.service';
 import { OWN_COMPANY_PATTERNS } from './own-company';
+import {
+  isGarbageCustomerLabel,
+  sanitizeVendorNameForImport,
+  stripCustomerNameLabel,
+} from '../../../common/utils/customer-name.util';
 
 /** Extracted line item from a PO PDF/XLS */
 export interface ExtractedLineItem {
@@ -722,6 +727,14 @@ export class PdfExtractionService {
     return '';
   }
 
+  /** Cloudstore / CFF / CMP POs: buyer is almost always Cloudstore Retail in the document body. */
+  private extractCloudstoreBuyerName(text: string): string {
+    if (!/CLOUDSTORE/i.test(text)) return '';
+    const m = text.match(/CLOUDSTORE\s+RETAIL\s+PRIVATE\s+LIMITED/i);
+    if (m) return 'Cloudstore Retail Private Limited';
+    return '';
+  }
+
   private parseCloudstorePo(text: string): PdfExtractionResult {
     const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
 
@@ -741,6 +754,7 @@ export class PdfExtractionService {
     );
 
     const vendorName = this.pickCounterpartyName(
+      this.extractCloudstoreBuyerName(text),
       this.extractBillingAddressCompany(text),
       this.extractShippingAddressCompany(text),
       this.extractVendorName(lines),
@@ -849,39 +863,20 @@ export class PdfExtractionService {
     return this.ownCompanyPatterns.some((p) => p.test(name));
   }
 
-  /** Labels and junk that pdf-parse sometimes puts where a company name should be. */
   private isGarbageVendorLabel(name: string): boolean {
-    const t = name
-      .trim()
-      .replace(/\uFF1A/g, ':')
-      .replace(/\u00A0/g, ' ');
-    if (t.length < 2) return true;
-    if (/^PO\s*No\.?\s*:/i.test(t)) return true;
-    if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;
-    if (/^P\.?O\.?\s*No\.?\s*:?\s*$/i.test(t)) return true;
-    if (/^Purchase\s*Order\s*No\.?\s*:?\s*$/i.test(t)) return true;
-    if (/^PO\s*Date\s*:?\s*$/i.test(t)) return true;
-    if (/^Expected\s*Delivery/i.test(t)) return true;
-    if (/^GSTIN\s*:?\s*$/i.test(t)) return true;
-    if (/^PAN\s*:?\s*$/i.test(t)) return true;
-    if (/^Address\s*:?\s*$/i.test(t)) return true;
-    if (/^Vendor\s*Name\s*:?\s*$/i.test(t)) return true;
-    if (/^Billing\s*Address\s*:?\s*$/i.test(t)) return true;
-    if (/^Ship(?:ping)?\s*(?:To|From)\s*:?\s*$/i.test(t)) return true;
-    if (/^(buyer|customer|vendor|consignee|bill\s*to)\s*:\s*$/i.test(t)) return true;
-    return false;
+    return isGarbageCustomerLabel(name);
   }
 
   private pickCounterpartyName(...candidates: Array<string | undefined>): string {
     for (const candidate of candidates) {
       if (!candidate) continue;
-      const c = candidate.trim();
-      if (!c || this.isGarbageVendorLabel(c)) continue;
-      if (!this.isOwnCompanyName(c)) return c;
+      const c = sanitizeVendorNameForImport(candidate);
+      if (!c || this.isOwnCompanyName(c)) continue;
+      return c;
     }
     for (const candidate of candidates) {
       if (!candidate) continue;
-      const c = candidate.trim();
+      const c = stripCustomerNameLabel(candidate.trim());
       if (!c || this.isGarbageVendorLabel(c)) continue;
       return c;
     }

@@ -14,7 +14,13 @@ import { PdfExtractionService } from '../../modules/po/services/pdf-extraction.s
 import { XlsExtractionService } from '../../modules/po/services/xls-extraction.service';
 import { PdfExtractionResult } from '../../modules/po/services/pdf-extraction.service';
 import { GrnService } from '../../modules/grn/services/grn.service';
-import { isGrnInboundEmail, pickPrimaryGrnPdf } from '../../email/grn-email.util';
+import {
+  attachmentLooksLikeGrnPdf,
+  isGrnInboundEmail,
+  isGrnInboxCandidate,
+  listPdfAttachments,
+  pickPrimaryGrnPdf,
+} from '../../email/grn-email.util';
 import { v4 as uuidv4 } from 'uuid';
 
 /** Summary returned by inbox monitor jobs so controllers can surface progress. */
@@ -29,6 +35,9 @@ export interface MonitorInboxSummary {
 }
 
 @Processor(QUEUE_NAMES.PO_PROCESSING, {
+  // Two slots so a manual GRN fetch can run while a long cron IMAP scan is still
+  // finishing in-process (evicting the cron job in Redis does not abort its handler).
+  concurrency: 2,
   // IMAP attachment downloads against Gmail throttle to ~3 s per FETCH even at
   // 8-way concurrency; a 200-mail SINCE 21d scan therefore runs ~60–90 min
   // wall-clock. We need a lock that survives the full parse window so BullMQ
@@ -100,8 +109,8 @@ export class PoProcessingProcessor extends WorkerHost {
   }
 
   private async monitorInboxFull(): Promise<MonitorInboxSummary> {
-    this.logger.log('Monitoring inbox for new PO/GRN emails (full scan, 21 days)...');
-    return this.runInboxMonitor('full', 21);
+    this.logger.log('Monitoring inbox for new UNSEEN PO/GRN emails...');
+    return this.runInboxMonitor('full', undefined, { unreadOnly: true });
   }
 
   /**
@@ -114,17 +123,21 @@ export class PoProcessingProcessor extends WorkerHost {
     mode: 'po' | 'grn',
   ): Promise<MonitorInboxSummary> {
     const label = mode === 'po' ? 'PO (manual)' : 'GRN (manual)';
+    // GRN fetch: bounded window — a full 5-year inbox scan can run 60–90+ minutes
+    // and leaves the UI polling "active" with an empty GRN list.
+    const sinceDays = mode === 'grn' ? 180 : undefined;
     this.logger.log(
-      `${label}: scanning ALL inbox mail (GRN-like ${
-        mode === 'po' ? 'skipped' : 'only'
-      }); already-imported messages are deduped via Message-ID`,
+      `${label}: scanning inbox (${
+        sinceDays ? `last ${sinceDays}d` : 'all time'
+      }, GRN-like ${mode === 'po' ? 'skipped' : 'only'}); Message-ID dedup`,
     );
-    return this.runInboxMonitor(mode);
+    return this.runInboxMonitor(mode, sinceDays);
   }
 
   private async runInboxMonitor(
     mode: 'full' | 'po' | 'grn',
     sinceDays?: number,
+    opts?: { unreadOnly?: boolean },
   ): Promise<MonitorInboxSummary> {
     const startedAt = Date.now();
     const summary: MonitorInboxSummary = {
@@ -138,16 +151,23 @@ export class PoProcessingProcessor extends WorkerHost {
     };
 
     try {
-      // Manual buttons → full inbox (sinceDays undefined). Cron → merged UNSEEN + SINCE window.
-      const fetched =
-        sinceDays === undefined
+      // PO manual → full inbox. GRN manual → SINCE window only (read mail included).
+      // Cron / full → UNSEEN only (fast; does not re-download last N days of mail).
+      const fetched = opts?.unreadOnly
+        ? await this.imapService.fetchUnreadEmails()
+        : sinceDays === undefined
           ? await this.imapService.fetchAllEmails()
-          : await this.imapService.fetchUnreadPlusRecentMerged(sinceDays);
+          : mode === 'grn'
+            ? await this.imapService.fetchRecentEmailsWithAttachments(sinceDays)
+            : await this.imapService.fetchUnreadPlusRecentMerged(sinceDays);
       summary.imapHits = fetched.imapMatchCount;
       const candidates = fetched.emails.filter((email) => {
         const grnLike = isGrnInboundEmail(email.subject, email.attachments);
+        const grnCandidate =
+          mode === 'grn' &&
+          isGrnInboxCandidate(email.subject, email.attachments);
         if (mode === 'po' && grnLike) return false;
-        if (mode === 'grn' && !grnLike) return false;
+        if (mode === 'grn' && !grnCandidate) return false;
         return true;
       });
       summary.emailsWithDocs = candidates.length;
@@ -157,12 +177,24 @@ export class PoProcessingProcessor extends WorkerHost {
         }): ${fetched.emails.length} doc-mails → ${candidates.length} to process`,
       );
 
+      let processed = 0;
       for (const email of candidates) {
         try {
           const outcome = await this.processEmail(email);
           if (outcome === 'po') summary.poCreated++;
           else if (outcome === 'grn') summary.grnCreated++;
           else if (outcome === 'duplicate') summary.skippedDuplicates++;
+          else if (mode === 'grn') {
+            summary.errors.push(
+              `Could not import GRN: ${email.subject?.slice(0, 120) || email.messageId}`,
+            );
+          }
+          processed++;
+          if (mode === 'grn' && processed % 5 === 0) {
+            this.logger.log(
+              `GRN import progress: ${processed}/${candidates.length}, +${summary.grnCreated} GRN`,
+            );
+          }
         } catch (error) {
           const msg = `Failed to process email ${email.messageId}: ${
             error instanceof Error ? error.message : String(error)
@@ -187,56 +219,29 @@ export class PoProcessingProcessor extends WorkerHost {
   private async processEmail(
     email: IncomingEmail,
   ): Promise<'po' | 'grn' | 'duplicate' | null> {
-    // GRN emails: subject/filename signals, PO number comes from the PDF
-    if (isGrnInboundEmail(email.subject, email.attachments)) {
-      const grnPdf = pickPrimaryGrnPdf(email.subject, email.attachments);
-      if (!grnPdf) {
-        this.logger.warn(`GRN-like email has no PDF attachment: ${email.subject}`);
-        return null;
-      }
-      if (email.messageId) {
-        const existing = await this.grnService.findByEmailMessageId(email.messageId);
-        if (existing) {
-          this.logger.log(`Skipping duplicate GRN email: ${email.messageId}`);
-          return 'duplicate';
-        }
-      }
-      const batchId = uuidv4();
-      const grnKey = `grn-files/${batchId}/${grnPdf.filename}`;
-      await this.storageService.uploadFile(grnKey, grnPdf.content, grnPdf.contentType);
-      try {
-        const grn = await this.grnService.createFromEmailPdf({
-          emailMessageId: email.messageId,
-          rawFileKey: grnKey,
-          pdfBuffer: grnPdf.content,
-        });
-        if (grn) {
-          this.logger.log(`Created GRN ${grn.grnNumber} from email "${email.subject}"`);
-          try {
-            const grnUrl = await this.storageService.getSignedUrl(grnKey, 24 * 60 * 60);
-            await this.whatsappService.sendGroupAlert(
-              `📋 *GRN from email*\nGRN#: ${grn.grnNumber}\nFile: ${grnPdf.filename}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
-              { mediaUrls: grnUrl ? [grnUrl] : [] },
-            );
-          } catch (waErr) {
-            this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);
-          }
-          return 'grn';
-        }
-      } catch (err) {
-        this.logger.error(
-          `GRN email processing failed (${email.subject}): ${err instanceof Error ? err.message : err}`,
-        );
-        throw err;
-      }
+    const grnFromSubject = isGrnInboundEmail(email.subject, email.attachments);
+    if (grnFromSubject) {
+      const outcome = await this.tryIngestGrnFromEmail(email);
+      if (outcome) return outcome;
+      this.logger.warn(
+        `GRN-shaped email could not be imported: ${email.subject}`,
+      );
       return null;
     }
 
-    // Skip if we've already processed this email as a PO
+    const sniffedPdf = await this.findGrnPdfByContent(email);
+    if (sniffedPdf) {
+      const outcome = await this.tryIngestGrnFromEmail(email, sniffedPdf);
+      if (outcome) return outcome;
+    }
+
+    // Same Message-ID may have been used for PO import; still try GRN PDF on that mail.
     if (
       email.messageId &&
       (await this.poService.isDuplicateEmail(email.messageId))
     ) {
+      const grnOnDup = await this.tryIngestGrnFromEmail(email);
+      if (grnOnDup) return grnOnDup;
       this.logger.log(`Skipping duplicate email: ${email.messageId}`);
       return 'duplicate';
     }
@@ -539,6 +544,121 @@ export class PoProcessingProcessor extends WorkerHost {
       grandTotal: xlsData.grandTotal || pdfData.grandTotal,
       totalTax: xlsData.totalTax || pdfData.totalTax,
     };
+  }
+
+  /**
+   * Pick a GRN PDF and persist it. Returns 'grn', 'duplicate', or null.
+   */
+  private async tryIngestGrnFromEmail(
+    email: IncomingEmail,
+    preferredPdf?: EmailAttachment,
+  ): Promise<'grn' | 'duplicate' | null> {
+    if (email.messageId) {
+      const existing = await this.grnService.findByEmailMessageId(email.messageId);
+      if (existing) {
+        this.logger.log(`Skipping duplicate GRN email: ${email.messageId}`);
+        return 'duplicate';
+      }
+    }
+
+    const pdfs = preferredPdf
+      ? [preferredPdf, ...listPdfAttachments(email.attachments).filter((p) => p !== preferredPdf)]
+      : this.rankGrnPdfCandidates(email.subject, email.attachments);
+    if (!pdfs.length) {
+      return null;
+    }
+
+    let lastErr: unknown;
+    for (const grnPdf of pdfs) {
+      const batchId = uuidv4();
+      const grnKey = `grn-files/${batchId}/${grnPdf.filename}`;
+      try {
+        await this.storageService.uploadFile(
+          grnKey,
+          grnPdf.content,
+          grnPdf.contentType,
+        );
+        const grn = await this.grnService.createFromEmailPdf({
+          emailMessageId: email.messageId,
+          emailSubject: email.subject,
+          rawFileKey: grnKey,
+          pdfBuffer: grnPdf.content,
+        });
+        if (!grn) continue;
+
+        this.logger.log(
+          `Created GRN ${grn.grnNumber} from email "${email.subject}" (${grnPdf.filename})`,
+        );
+        try {
+          const grnUrl = await this.storageService.getSignedUrl(grnKey, 24 * 60 * 60);
+          await this.whatsappService.sendGroupAlert(
+            `📋 *GRN from email*\nGRN#: ${grn.grnNumber}\nFile: ${grnPdf.filename}\nReceived: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`,
+            { mediaUrls: grnUrl ? [grnUrl] : [] },
+          );
+        } catch (waErr) {
+          this.logger.warn(`WhatsApp notification failed (non-fatal): ${waErr}`);
+        }
+        return 'grn';
+      } catch (err) {
+        lastErr = err;
+        this.logger.warn(
+          `GRN PDF attempt failed (${email.subject} / ${grnPdf.filename}): ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+      }
+    }
+
+    if (lastErr) {
+      this.logger.error(
+        `GRN email processing failed (${email.subject}): ${
+          lastErr instanceof Error ? lastErr.message : lastErr
+        }`,
+      );
+    }
+    return null;
+  }
+
+  /** Try GRN-named PDFs first, then other non–purchase-order attachments. */
+  private rankGrnPdfCandidates(
+    subject: string,
+    attachments: EmailAttachment[],
+  ): EmailAttachment[] {
+    const pdfs = listPdfAttachments(attachments);
+    const primary = pickPrimaryGrnPdf(subject, attachments);
+    const scored = pdfs.map((p) => {
+      let score = 0;
+      if (p === primary) score += 100;
+      if (attachmentLooksLikeGrnPdf(p)) score += 50;
+      if (/goods|received|grn|challan|delivery/i.test(p.filename)) score += 40;
+      if (/purchase[_\s-]*order|po[_\s-]*schedule/i.test(p.filename)) score -= 30;
+      return { p, score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.map((s) => s.p);
+  }
+
+  /** When subject/filename are generic, detect GRN PDFs by document content. */
+  private async findGrnPdfByContent(
+    email: IncomingEmail,
+  ): Promise<EmailAttachment | undefined> {
+    for (const pdf of listPdfAttachments(email.attachments)) {
+      try {
+        if (await this.grnService.pdfLooksLikeGrn(pdf.content)) {
+          this.logger.log(
+            `GRN PDF detected by content: ${pdf.filename} (${email.subject})`,
+          );
+          return pdf;
+        }
+      } catch (err) {
+        this.logger.warn(
+          `GRN sniff failed for ${pdf.filename}: ${
+            err instanceof Error ? err.message : err
+          }`,
+        );
+      }
+    }
+    return undefined;
   }
 
   private async processPoEmail(data: {

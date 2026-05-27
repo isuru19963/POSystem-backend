@@ -33,6 +33,12 @@ import { PdfExtractionService, PdfExtractionResult } from '../../po/services/pdf
 import { XlsExtractionService } from '../../po/services/xls-extraction.service';
 import { StorageService } from '../../../storage/storage.service';
 import { ValidationService } from '../../validation/services/validation.service';
+import {
+  isGarbageCustomerLabel,
+  looksLikeMisimportedVendorName,
+  stripCustomerNameLabel,
+  sanitizeVendorNameForImport,
+} from '../../../common/utils/customer-name.util';
 import { isOwnCompanyName } from '../../po/services/own-company';
 import { PoService } from '../../po/services/po.service';
 
@@ -465,32 +471,100 @@ export class AdminService {
   }
 
   private looksLikeMisimportedVendor(v: Vendor): boolean {
-    const name = (v.name || '').trim();
-    if (!name) return true;
-    // Extraction bug: UUID stored as display name
-    if (
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-        name,
-      )
-    ) {
-      return true;
+    return looksLikeMisimportedVendorName(v.name || '', v.code);
+  }
+
+  /**
+   * Fix existing vendor rows: strip "Buyer Name:" prefixes, purge "PO No :" junk,
+   * merge duplicates when two rows resolve to the same company.
+   */
+  async repairVendorDisplayNames(userId: string): Promise<{
+    renamed: number;
+    merged: number;
+    purged: number;
+    purchaseOrdersReassigned: number;
+  }> {
+    const all = await this.vendorRepo.find({ order: { createdAt: 'ASC' } });
+    let renamed = 0;
+    let merged = 0;
+    let purged = 0;
+    let purchaseOrdersReassigned = 0;
+
+    const findByName = async (name: string) =>
+      this.vendorRepo.findOne({ where: { name } });
+
+    for (const v of all) {
+      const raw = (v.name || '').trim();
+      if (!raw) continue;
+
+      if (looksLikeMisimportedVendorName(raw, v.code)) {
+        const pos = await this.poRepo.find({
+          where: { vendorId: v.id },
+          select: ['poNumber'],
+        });
+        for (const po of pos) {
+          try {
+            await this.repairPurchaseOrderCustomerFromStoredSource(
+              po.poNumber,
+              userId,
+            );
+          } catch {
+            /* continue */
+          }
+        }
+        const refreshed = await this.vendorRepo.findOne({ where: { id: v.id } });
+        if (
+          refreshed &&
+          looksLikeMisimportedVendorName(refreshed.name, refreshed.code)
+        ) {
+          const poCount = await this.poRepo.count({ where: { vendorId: v.id } });
+          if (poCount === 0) {
+            await this.vendorRepo.delete(v.id);
+            purged++;
+          }
+        }
+        continue;
+      }
+
+      const fixed = stripCustomerNameLabel(raw);
+      if (!fixed || isGarbageCustomerLabel(fixed) || fixed === raw) continue;
+
+      const existing = await findByName(fixed);
+      if (existing && existing.id !== v.id) {
+        const updated = await this.poRepo.update(
+          { vendorId: v.id },
+          { vendorId: existing.id },
+        );
+        purchaseOrdersReassigned += updated.affected ?? 0;
+        await this.vendorRepo.delete(v.id);
+        merged++;
+        continue;
+      }
+
+      v.name = fixed;
+      v.code = fixed.replace(/\s+/g, '_').slice(0, 50);
+      await this.vendorRepo.save(v);
+      renamed++;
     }
-    // PDF/email line pasted as "vendor" — contains PO metadata
-    if (/PO\s*No\.?\s*[:-]/i.test(name)) return true;
-    if (/PO\s*Date/i.test(name)) return true;
-    if (/Purchase\s+Order/i.test(name) && name.length > 50) return true;
-    // Leading dash + typical PO tokens from bad extraction (incl. BLRPO / CFFP… typos)
-    if (
-      /^\s*-\s+/.test(name) &&
-      /(CFFPO|CFFP|BLRP|BLRPO|CMPPO|CPCAP|P\d{6,}|PO\s)/i.test(name)
-    ) {
-      return true;
-    }
-    return false;
+
+    await this.createAuditLog(userId, 'vendor', 'bulk', 'repair_display_names', {}, {
+      renamed,
+      merged,
+      purged,
+      purchaseOrdersReassigned,
+    });
+
+    return { renamed, merged, purged, purchaseOrdersReassigned };
   }
 
   async createVendor(data: Partial<Vendor>): Promise<Vendor> {
-    return this.vendorRepo.save(this.vendorRepo.create(data));
+    const name = sanitizeVendorNameForImport(data.name) || data.name?.trim();
+    if (!name || isGarbageCustomerLabel(name)) {
+      throw new BadRequestException(
+        'Customer name must be a real company name, not a PO field label',
+      );
+    }
+    return this.vendorRepo.save(this.vendorRepo.create({ ...data, name }));
   }
 
   async updateVendor(
@@ -500,6 +574,16 @@ export class AdminService {
   ): Promise<Vendor> {
     const vendor = await this.vendorRepo.findOne({ where: { id } });
     if (!vendor) throw new NotFoundException(`Vendor ${id} not found`);
+
+    if (data.name != null) {
+      const name = sanitizeVendorNameForImport(data.name) || data.name.trim();
+      if (!name || isGarbageCustomerLabel(name)) {
+        throw new BadRequestException(
+          'Customer name must be a real company name, not a PO field label',
+        );
+      }
+      data.name = name;
+    }
 
     await this.createAuditLog(userId, 'vendor', id, 'update', { ...vendor } as unknown as Record<string, unknown>, data as Record<string, unknown>);
     Object.assign(vendor, data);
@@ -646,32 +730,188 @@ export class AdminService {
     }
   }
 
-  /** Mirrors PdfExtractionService garbage checks for customer display strings. */
   private isGarbageCustomerLabel(name: string): boolean {
-    const t = name
-      .trim()
-      .replace(/\uFF1A/g, ':')
-      .replace(/\u00A0/g, ' ');
-    if (t.length < 2) return true;
-    if (/^PO\s*No\.?\s*:/i.test(t)) return true;
-    if (/^PO\s*Number\s*:?\s*$/i.test(t)) return true;
-    if (/^P\.?O\.?\s*No\.?\s*:?\s*$/i.test(t)) return true;
-    if (/^Purchase\s*Order\s*No\.?\s*:?\s*$/i.test(t)) return true;
-    if (/^PO\s*Date\s*:?\s*$/i.test(t)) return true;
-    if (/^Expected\s*Delivery/i.test(t)) return true;
-    if (/^GSTIN\s*:?\s*$/i.test(t)) return true;
-    if (/^PAN\s*:?\s*$/i.test(t)) return true;
-    if (/^Address\s*:?\s*$/i.test(t)) return true;
-    if (/^Vendor\s*Name\s*:?\s*$/i.test(t)) return true;
-    if (/^Billing\s*Address\s*:?\s*$/i.test(t)) return true;
-    if (/^Ship(?:ping)?\s*(?:To|From)\s*:?\s*$/i.test(t)) return true;
-    if (/^(buyer|customer|vendor|consignee|bill\s*to)\s*:\s*$/i.test(t)) return true;
-    return false;
+    return isGarbageCustomerLabel(name);
   }
 
   private extractionVendorIsUsable(name: string): boolean {
-    const t = name.trim();
+    const t = sanitizeVendorNameForImport(name) || name.trim();
     return !!t && !this.isGarbageCustomerLabel(t) && !isOwnCompanyName(t);
+  }
+
+  private scoreCustomerExtraction(result: PdfExtractionResult): number {
+    let score = 0;
+    if (this.extractionVendorIsUsable(result.vendorName ?? '')) {
+      score += 20;
+      if (/cloudstore/i.test(result.vendorName ?? '')) score += 8;
+    }
+    if (result.shippingLocation?.trim()) score += 4;
+    if (result.lineItems?.length) score += Math.min(result.lineItems.length, 6);
+    if (result.poNumber?.trim()) score += 2;
+    return score;
+  }
+
+  private inferCloudstoreBuyerFallback(
+    rawText: string,
+    poNumber?: string,
+  ): string | null {
+    const po = (poNumber ?? '').trim();
+    const isCloudstorePo =
+      /^(CFF|CMP)PO/i.test(po) || /CLOUDSTORE/i.test(rawText);
+    if (!isCloudstorePo) return null;
+    if (/CLOUDSTORE\s+RETAIL/i.test(rawText)) {
+      return 'Cloudstore Retail Private Limited';
+    }
+    return null;
+  }
+
+  private async extractFromStoredKey(
+    s3Key: string,
+    buffer: Buffer,
+  ): Promise<PdfExtractionResult> {
+    const lower = s3Key.toLowerCase();
+    if (lower.endsWith('.pdf')) {
+      return this.pdfExtractionService.extract(buffer);
+    }
+    if (/\.(xls|xlsx|csv)$/i.test(lower)) {
+      const base = s3Key.split('/').pop() || s3Key;
+      return this.xlsExtractionService.extract(buffer, base);
+    }
+    throw new BadRequestException(
+      `Unsupported stored file type for key ${s3Key}; expected .pdf, .xls, .xlsx, or .csv`,
+    );
+  }
+
+  /**
+   * Cloudstore POs usually have both PDF + XLS on S3. The spreadsheet’s billing
+   * block is more reliable than PDF text order (which often yields "PO No :").
+   */
+  private async attemptExtractCustomerFromStoredFiles(
+    sourceRow: PurchaseOrder,
+    poNumber: string,
+  ): Promise<
+    | { ok: true; extracted: PdfExtractionResult; sourceKey: string }
+    | { ok: false; errors: string[]; allMissingStoredFiles: boolean }
+  > {
+    const keys = [
+      ...new Set(
+        [sourceRow.rawXlsFileKey, sourceRow.rawFileKey].filter(
+          (k): k is string => !!k?.trim(),
+        ),
+      ),
+    ];
+    if (!keys.length) {
+      throw new BadRequestException(
+        'This PO has no stored PDF/XLS key on S3. Re-upload the file to repair.',
+      );
+    }
+
+    let best: PdfExtractionResult | null = null;
+    let bestKey = '';
+    let bestScore = -1;
+    const errors: string[] = [];
+
+    for (const s3Key of keys) {
+      try {
+        const buffer = await this.storageService.getFile(s3Key);
+        let extracted = await this.extractFromStoredKey(s3Key, buffer);
+        const fallback = this.inferCloudstoreBuyerFallback(
+          extracted.rawText ?? '',
+          extracted.poNumber || poNumber,
+        );
+        if (
+          fallback &&
+          !this.extractionVendorIsUsable(extracted.vendorName ?? '')
+        ) {
+          extracted = { ...extracted, vendorName: fallback };
+        }
+        const score = this.scoreCustomerExtraction(extracted);
+        this.logger.log(
+          `Repair extract ${s3Key}: vendor="${extracted.vendorName || ''}" score=${score}`,
+        );
+        if (score > bestScore) {
+          bestScore = score;
+          best = extracted;
+          bestKey = s3Key;
+        }
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        errors.push(`${s3Key}: ${msg}`);
+        this.logger.warn(`Repair skipped ${s3Key}: ${msg}`);
+      }
+    }
+
+    if (best) {
+      return { ok: true, extracted: best, sourceKey: bestKey };
+    }
+
+    const allMissingStoredFiles =
+      errors.length > 0 &&
+      errors.every((e) => /not found in S3|not found on server/i.test(e));
+
+    return { ok: false, errors, allMissingStoredFiles };
+  }
+
+  private async extractBestCustomerFromStoredFiles(
+    sourceRow: PurchaseOrder,
+    poNumber: string,
+  ): Promise<{
+    extracted: PdfExtractionResult;
+    sourceKey: string;
+    restoredSourceFromEmail: boolean;
+  }> {
+    let row = sourceRow;
+    let restoredSourceFromEmail = false;
+
+    for (let pass = 0; pass < 2; pass++) {
+      const attempt = await this.attemptExtractCustomerFromStoredFiles(row, poNumber);
+      if (attempt.ok) {
+        return {
+          extracted: attempt.extracted,
+          sourceKey: attempt.sourceKey,
+          restoredSourceFromEmail,
+        };
+      }
+
+      const msgId = row.emailMessageId?.trim();
+      const canRestoreFromEmail = !!msgId && !msgId.startsWith('upload-');
+
+      if (
+        pass === 0 &&
+        attempt.allMissingStoredFiles &&
+        canRestoreFromEmail
+      ) {
+        this.logger.log(
+          `S3 files missing for PO ${poNumber}; re-downloading attachments from email`,
+        );
+        try {
+          await this.poService.restoreSourceFilesFromEmail(row.id);
+          const refreshed = await this.poRepo.findOne({ where: { id: row.id } });
+          if (refreshed) {
+            row = refreshed;
+            restoredSourceFromEmail = true;
+            continue;
+          }
+        } catch (restoreErr) {
+          const restoreMsg =
+            (restoreErr as Error)?.message ?? String(restoreErr);
+          throw new BadRequestException(
+            `Stored files are missing from S3 and could not be restored from email: ${restoreMsg}`,
+          );
+        }
+      }
+
+      const hint = canRestoreFromEmail
+        ? ' Open the PO drawer and use “Restore from email”, then try again.'
+        : ' This PO was uploaded manually — re-upload the PDF or spreadsheet.';
+      throw new BadRequestException(
+        `Could not extract customer from any stored file. ${attempt.errors.join('; ')}.${hint}`,
+      );
+    }
+
+    throw new BadRequestException(
+      `Could not extract customer from stored files for PO ${poNumber}.`,
+    );
   }
 
   /**
@@ -691,6 +931,7 @@ export class AdminService {
     newVendorId: string;
     newVendorName: string;
     shippingLocation: string;
+    restoredSourceFromEmail: boolean;
   }> {
     const trimmed = poNumber.trim();
     if (!trimmed) throw new BadRequestException('poNumber is required');
@@ -716,36 +957,17 @@ export class AdminService {
     const sourceRow =
       rowsToRepair.find(hasKey) ?? pos.find(hasKey) ?? rowsToRepair[0];
 
-    const s3Key = sourceRow.rawFileKey || sourceRow.rawXlsFileKey;
-    if (!s3Key) {
-      throw new BadRequestException(
-        'This PO has no stored PDF/XLS key on S3 (rawFileKey / rawXlsFileKey empty). Re-upload the file to repair.',
-      );
-    }
-
-    let buffer: Buffer;
-    try {
-      buffer = await this.storageService.getFile(s3Key);
-    } catch (err) {
-      this.logger.error(`getFile failed for key=${s3Key}`, err as Error);
-      throw new BadRequestException(
-        `Could not download the stored file from S3 (${s3Key}). Check the key and IAM permissions, or re-upload the PO.`,
-      );
-    }
-
     let extracted: PdfExtractionResult;
-    const lower = s3Key.toLowerCase();
+    let repairedFromS3Key: string;
+    let restoredSourceFromEmail = false;
     try {
-      if (lower.endsWith('.pdf')) {
-        extracted = await this.pdfExtractionService.extract(buffer);
-      } else if (/\.(xls|xlsx|csv)$/i.test(lower)) {
-        const base = s3Key.split('/').pop() || s3Key;
-        extracted = this.xlsExtractionService.extract(buffer, base);
-      } else {
-        throw new BadRequestException(
-          `Unsupported stored file type for key ${s3Key}; expected .pdf, .xls, .xlsx, or .csv`,
-        );
-      }
+      const best = await this.extractBestCustomerFromStoredFiles(
+        sourceRow,
+        trimmed,
+      );
+      extracted = best.extracted;
+      repairedFromS3Key = best.sourceKey;
+      restoredSourceFromEmail = best.restoredSourceFromEmail;
     } catch (err) {
       if (err instanceof BadRequestException) throw err;
       this.logger.error(`Re-extraction threw for ${trimmed}`, err as Error);
@@ -804,7 +1026,7 @@ export class AdminService {
       row.extractedData = {
         ...base,
         repairedCustomerFromSourceAt: new Date().toISOString(),
-        repairedFromS3Key: s3Key,
+        repairedFromS3Key: repairedFromS3Key,
         repairedExtractionVendorName: vendorName,
         repairedExtractionShippingLocation: extracted.shippingLocation ?? '',
       };
@@ -878,6 +1100,7 @@ export class AdminService {
         newVendorId: vendor.id,
         newVendorName: vendor.name,
         shippingLocation: winnerSibling.shippingLocation,
+        restoredSourceFromEmail,
       };
     }
 
@@ -933,6 +1156,7 @@ export class AdminService {
       newVendorId: vendor.id,
       newVendorName: vendor.name,
       shippingLocation: primary.shippingLocation,
+      restoredSourceFromEmail,
     };
   }
 

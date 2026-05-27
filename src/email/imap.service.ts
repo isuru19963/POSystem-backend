@@ -2,7 +2,10 @@ import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/commo
 import { ConfigService } from '@nestjs/config';
 import * as imapSimple from 'imap-simple';
 import { decodeMimeWords } from './mime-word.util';
-import { canonicalMessageId } from '../common/utils/email-message-id.util';
+import {
+  canonicalMessageId,
+  messageIdSearchVariants,
+} from '../common/utils/email-message-id.util';
 
 export interface EmailAttachment {
   filename: string;
@@ -318,6 +321,77 @@ export class ImapService implements OnModuleInit, OnModuleDestroy {
    */
   async fetchAllEmails(): Promise<ImapFetchOutcome> {
     return this.fetchRecentEmailsWithAttachments(365 * 5);
+  }
+
+  /**
+   * Fetch one mailbox message by RFC Message-ID (re-download PO attachments).
+   * Tries Gmail `rfc822msgid:` or standard `HEADER Message-ID` search.
+   */
+  async fetchEmailByMessageId(messageId: string): Promise<IncomingEmail | null> {
+    const variants = messageIdSearchVariants(messageId);
+    if (!variants.length) return null;
+
+    const target = canonicalMessageId(messageId);
+    this.logger.log(`IMAP lookup by Message-ID (${variants.length} variant(s))`);
+
+    return this.withConn(async (conn) => {
+      let messages: imapSimple.Message[] = [];
+
+      if (this.useGmailXRawSearch()) {
+        for (const id of variants) {
+          const inner = id.replace(/^<|>$/g, '').trim();
+          if (!inner) continue;
+          const found = await withTimeout(
+            conn.search([['X-GM-RAW', `rfc822msgid:${inner}`]], {
+              bodies: ['HEADER'],
+              markSeen: false,
+              struct: true,
+            }),
+            IMAP_SEARCH_TIMEOUT_MS,
+            `Gmail rfc822msgid lookup`,
+          );
+          if (found.length) {
+            messages = found;
+            break;
+          }
+        }
+      } else {
+        for (const id of variants) {
+          const inner = id.replace(/^<|>$/g, '').trim();
+          if (!inner) continue;
+          const found = await withTimeout(
+            conn.search([['HEADER', 'Message-ID', inner]], {
+              bodies: ['HEADER'],
+              markSeen: false,
+              struct: true,
+            }),
+            IMAP_SEARCH_TIMEOUT_MS,
+            `HEADER Message-ID lookup`,
+          );
+          if (found.length) {
+            messages = found;
+            break;
+          }
+        }
+      }
+
+      if (!messages.length) {
+        this.logger.warn(`No IMAP message found for Message-ID ${messageId}`);
+        return null;
+      }
+
+      const emails = await withTimeout(
+        this.parseMessages(conn, messages),
+        IMAP_PARSE_TIMEOUT_MS,
+        'IMAP parse single message',
+      );
+
+      return (
+        emails.find((e) => canonicalMessageId(e.messageId) === target) ??
+        emails[0] ??
+        null
+      );
+    });
   }
 
   async fetchRecentEmailsWithAttachments(sinceDays: number = 21): Promise<ImapFetchOutcome> {

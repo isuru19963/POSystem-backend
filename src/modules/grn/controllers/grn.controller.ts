@@ -14,7 +14,10 @@ import {
   JOB_NAMES,
   QUEUE_NAMES,
 } from '../../../common/constants/app.constants';
-import { enqueueManualInboxFetch } from '../../../queue/inbox-monitor.helpers';
+import {
+  enqueueManualInboxFetch,
+  getInboxJobStatus,
+} from '../../../queue/inbox-monitor.helpers';
 
 @Controller('grn')
 export class GrnController {
@@ -63,21 +66,13 @@ export class GrnController {
   /** Poll the status of a previously-queued inbox monitor job. */
   @Get('fetch-from-email/status/:jobId')
   async fetchFromEmailStatus(@Param('jobId') jobId: string) {
-    const job = await this.poProcessingQueue.getJob(jobId);
-    if (!job) {
+    const status = await getInboxJobStatus(this.poProcessingQueue, jobId);
+    if (!status) {
       throw new NotFoundException(
         `Job ${jobId} not found — it may have completed and been cleaned up.`,
       );
     }
-    const state = await job.getState();
-    return {
-      jobId,
-      state,
-      result: job.returnvalue ?? null,
-      failedReason: job.failedReason ?? null,
-      processedOn: job.processedOn ?? null,
-      finishedOn: job.finishedOn ?? null,
-    };
+    return status;
   }
 
   /**

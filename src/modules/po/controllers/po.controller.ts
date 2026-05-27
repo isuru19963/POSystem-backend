@@ -1,7 +1,9 @@
 import {
+  Body,
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   HttpCode,
   HttpStatus,
@@ -13,7 +15,10 @@ import {
   UploadedFile,
   BadRequestException,
   Logger,
+  Res,
 } from '@nestjs/common';
+import type { Response } from 'express';
+import { IsUUID } from 'class-validator';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -25,7 +30,10 @@ import {
   JOB_NAMES,
   QUEUE_NAMES,
 } from '../../../common/constants/app.constants';
-import { enqueueManualInboxFetch } from '../../../queue/inbox-monitor.helpers';
+import {
+  enqueueManualInboxFetch,
+  getInboxJobStatus,
+} from '../../../queue/inbox-monitor.helpers';
 
 /**
  * Parse a date string that may be in dd/mm/yyyy, dd-mm-yyyy, dd.mm.yyyy or ISO formats.
@@ -69,6 +77,11 @@ function parsePoDate(dateStr?: string): Date | undefined {
   return date;
 }
 
+class MapLineItemSkuDto {
+  @IsUUID()
+  skuId!: string;
+}
+
 @Controller('po')
 export class PoController {
   private readonly logger = new Logger(PoController.name);
@@ -86,9 +99,85 @@ export class PoController {
     return this.poService.findAll(query);
   }
 
+  /**
+   * Distinct vendor item codes seen on PO line items that have not been
+   * matched to an SKU in our catalogue. Drives the admin "missing SKU"
+   * worklist on the PO list page.
+   */
+  @Get('unmapped-items')
+  listUnmappedItemCodes() {
+    return this.poService.listUnmappedItemCodes();
+  }
+
   @Get(':id')
   findById(@Param('id', ParseUUIDPipe) id: string) {
     return this.poService.findById(id);
+  }
+
+  /**
+   * Stream the original PO PDF or spreadsheet from S3/local storage.
+   * Use disposition=inline to open in the browser, attachment to download.
+   */
+  /**
+   * Re-download PDF/XLS from the mailbox for POs missing files on S3.
+   * Uses the stored email Message-ID; does not create a duplicate PO.
+   */
+  @Post(':id/restore-source-from-email')
+  @HttpCode(HttpStatus.OK)
+  restoreSourceFromEmail(@Param('id', ParseUUIDPipe) id: string) {
+    return this.poService.restoreSourceFilesFromEmail(id);
+  }
+
+  @Get(':id/source-file')
+  async getSourceFile(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query('kind') kind: 'pdf' | 'xls' | undefined,
+    @Query('disposition') disposition: 'inline' | 'attachment' | undefined,
+    @Res() res: Response,
+  ) {
+    const { buffer, fileName, contentType } = await this.poService.getSourceFile(
+      id,
+      kind,
+    );
+    const disp =
+      disposition === 'attachment' ? 'attachment' : 'inline';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader(
+      'Content-Disposition',
+      `${disp}; filename="${fileName.replace(/"/g, '')}"`,
+    );
+    res.send(buffer);
+  }
+
+  /**
+   * Map one PO line item to an SKU in our master catalogue. Once every line
+   * item on the PO is mapped, the PO is auto-promoted out of
+   * NEEDS_SKU_MAPPING and re-validated.
+   */
+  @Patch(':poId/line-items/:lineItemId/sku')
+  mapLineItemSku(
+    @Param('poId', ParseUUIDPipe) poId: string,
+    @Param('lineItemId', ParseUUIDPipe) lineItemId: string,
+    @Body() dto: MapLineItemSkuDto,
+  ) {
+    return this.poService.mapLineItemSku(poId, lineItemId, dto.skuId);
+  }
+
+  /**
+   * Re-run SKU resolution against the current catalogue for every unmapped
+   * line item on a PO. Useful after admins add a missing SKU.
+   */
+  @Post(':poId/rematch-skus')
+  @HttpCode(HttpStatus.OK)
+  rematchSkus(@Param('poId', ParseUUIDPipe) poId: string) {
+    return this.poService.rematchSkus(poId);
+  }
+
+  /** Re-match every unmapped line item on all POs (after catalogue / matcher updates). */
+  @Post('rematch-all-skus')
+  @HttpCode(HttpStatus.OK)
+  rematchAllSkus() {
+    return this.poService.rematchAllUnmappedSkus();
   }
 
   /** Flush all PO and PO-linked records (testing use only). */
@@ -107,23 +196,29 @@ export class PoController {
 
   @Post('reprocess-all')
   async reprocessAll() {
-    await this.poProcessingQueue.add('reprocess-all', {}, {
-      removeOnComplete: true,
-      removeOnFail: 5,
-    });
+    await this.poProcessingQueue.add(
+      'reprocess-all',
+      {},
+      {
+        removeOnComplete: true,
+        removeOnFail: 5,
+      },
+    );
     return { message: 'Reprocess-all job queued' };
   }
 
   /** Extract data from an uploaded PO file (PDF or XLS) without saving */
   @Post('extract')
   @UseInterceptors(FileInterceptor('file'))
-  async extractFromFile(
-    @UploadedFile() file: Express.Multer.File,
-  ) {
+  async extractFromFile(@UploadedFile() file: Express.Multer.File) {
     if (!file) throw new BadRequestException('No file uploaded');
 
     const filename = file.originalname.toLowerCase();
-    if (filename.endsWith('.xls') || filename.endsWith('.xlsx') || filename.endsWith('.csv')) {
+    if (
+      filename.endsWith('.xls') ||
+      filename.endsWith('.xlsx') ||
+      filename.endsWith('.csv')
+    ) {
       return this.xlsExtractionService.extract(file.buffer, file.originalname);
     } else if (filename.endsWith('.pdf')) {
       return this.pdfExtractionService.extract(file.buffer);
@@ -137,16 +232,21 @@ export class PoController {
   /** Upload a PO file and create a PO record from it */
   @Post('upload')
   @UseInterceptors(FileInterceptor('file'))
-  async uploadAndCreate(
-    @UploadedFile() file: Express.Multer.File,
-  ) {
+  async uploadAndCreate(@UploadedFile() file: Express.Multer.File) {
     if (!file) throw new BadRequestException('No file uploaded');
 
     const filename = file.originalname.toLowerCase();
     let extracted;
 
-    if (filename.endsWith('.xls') || filename.endsWith('.xlsx') || filename.endsWith('.csv')) {
-      extracted = await this.xlsExtractionService.extract(file.buffer, file.originalname);
+    if (
+      filename.endsWith('.xls') ||
+      filename.endsWith('.xlsx') ||
+      filename.endsWith('.csv')
+    ) {
+      extracted = await this.xlsExtractionService.extract(
+        file.buffer,
+        file.originalname,
+      );
     } else if (filename.endsWith('.pdf')) {
       extracted = await this.pdfExtractionService.extract(file.buffer);
     } else {
@@ -199,20 +299,12 @@ export class PoController {
   /** Poll the status of a previously-queued inbox monitor job. */
   @Get('fetch-from-email/status/:jobId')
   async fetchFromEmailStatus(@Param('jobId') jobId: string) {
-    const job = await this.poProcessingQueue.getJob(jobId);
-    if (!job) {
+    const status = await getInboxJobStatus(this.poProcessingQueue, jobId);
+    if (!status) {
       throw new NotFoundException(
         `Job ${jobId} not found — it may have completed and been cleaned up.`,
       );
     }
-    const state = await job.getState();
-    return {
-      jobId,
-      state, // 'waiting' | 'active' | 'completed' | 'failed' | 'delayed' | …
-      result: job.returnvalue ?? null,
-      failedReason: job.failedReason ?? null,
-      processedOn: job.processedOn ?? null,
-      finishedOn: job.finishedOn ?? null,
-    };
+    return status;
   }
 }

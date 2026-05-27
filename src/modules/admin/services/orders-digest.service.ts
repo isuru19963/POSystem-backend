@@ -3,16 +3,10 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { PurchaseOrder, NotificationContact } from '../../../database/entities';
 import { WhatsappService } from '../../../whatsapp/whatsapp.service';
+import { formatWhatsAppSendError } from '../../../whatsapp/whatsapp.errors';
+import { istDateString } from '../../../common/utils/ist-date.util';
 
-/** Calendar date YYYY-MM-DD in Asia/Kolkata */
-export function istDateString(d = new Date()): string {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Kolkata',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(d);
-}
+export { istDateString } from '../../../common/utils/ist-date.util';
 
 /**
  * Sends a daily WhatsApp digest of POs whose PO date OR expected delivery date
@@ -147,13 +141,32 @@ export class OrdersDigestService {
       `Today's Orders digest (${todayStr} IST): ${pos.length} PO(s) → ${contacts.length} contact(s)`,
     );
 
+    const templateSummary =
+      pos.length > 0
+        ? `${headerHuman}: ${pos.length} purchase order(s) scheduled for delivery today. Review the full list in the order portal.`
+        : `${headerHuman}: no purchase orders with PO date or delivery date today.`;
+
     const results = await Promise.all(
       contacts.map(async (c) => {
         try {
-          await this.whatsappService.sendMessage(c.phone, body);
-          return { ok: true as const, phone: c.phone };
+          const r = await this.whatsappService.sendScheduledNotification(
+            c.phone,
+            body,
+            {
+              templatePurpose: 'daily_orders',
+              templateSummary,
+            },
+          );
+          if (r.mode === 'skipped') {
+            return {
+              ok: false as const,
+              phone: c.phone,
+              error: r.error || 'WhatsApp send skipped',
+            };
+          }
+          return { ok: true as const, phone: c.phone, mode: r.mode };
         } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
+          const msg = formatWhatsAppSendError(err);
           this.logger.warn(`WhatsApp digest failed for ${c.phone}: ${msg}`);
           return { ok: false as const, phone: c.phone, error: msg };
         }

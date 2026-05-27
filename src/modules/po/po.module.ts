@@ -13,6 +13,7 @@ import {
 } from '../../database/entities';
 import { PoController } from './controllers/po.controller';
 import { PoService } from './services/po.service';
+import { SkuResolutionService } from './services/sku-resolution.service';
 import { PdfExtractionService } from './services/pdf-extraction.service';
 import { XlsExtractionService } from './services/xls-extraction.service';
 import { AiPoExtractionService } from './services/ai-po-extraction.service';
@@ -43,7 +44,19 @@ import { NotificationContact } from '../../database/entities';
     ValidationModule,
   ],
   controllers: [PoController],
-  providers: [PoService, PdfExtractionService, XlsExtractionService, AiPoExtractionService],
-  exports: [PoService, PdfExtractionService, XlsExtractionService, AiPoExtractionService],
+  providers: [
+    PoService,
+    SkuResolutionService,
+    PdfExtractionService,
+    XlsExtractionService,
+    AiPoExtractionService,
+  ],
+  exports: [
+    PoService,
+    SkuResolutionService,
+    PdfExtractionService,
+    XlsExtractionService,
+    AiPoExtractionService,
+  ],
 })
 export class PoModule {}

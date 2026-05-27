@@ -1,4 +1,9 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  OnModuleInit,
+} from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { IsNull, Repository } from 'typeorm';
 import {
@@ -116,6 +121,28 @@ export class ValidationService implements OnModuleInit {
 
     if (!po) throw new Error(`PO ${poId} not found`);
 
+    // Hard gate: every line item must be mapped to an SKU before we let the
+    // PO through validation. Without that mapping we can't compute pricing,
+    // we can't consolidate by SKU, and downstream reports would have to fall
+    // back to vendor item codes — which is exactly the regression we're
+    // protecting against. The PO is held in NEEDS_SKU_MAPPING until either
+    // the admin adds the missing SKU and re-matches, or maps each line item
+    // by hand from the drawer.
+    const unmappedLineItems = (po.lineItems ?? []).filter((li) => !li.skuId);
+    if (unmappedLineItems.length > 0) {
+      if (po.status !== PoStatus.NEEDS_SKU_MAPPING) {
+        po.status = PoStatus.NEEDS_SKU_MAPPING;
+        await this.poRepo.save(po);
+      }
+      const sample = unmappedLineItems
+        .slice(0, 5)
+        .map((li) => li.itemCode || '(no code)')
+        .join(', ');
+      throw new BadRequestException(
+        `PO ${po.poNumber} has ${unmappedLineItems.length} line item(s) without an SKU mapping — cannot validate until each is mapped. Sample: ${sample}`,
+      );
+    }
+
     // Resolve NECC city from shipping location
     const locationMapping = await this.locationMappingRepo.findOne({
       where: { shippingLocation: po.shippingLocation },
@@ -128,20 +155,12 @@ export class ValidationService implements OnModuleInit {
     for (const lineItem of po.lineItems) {
       try {
         if (!lineItem.sku) {
-          this.logger.warn(
-            `Line item ${lineItem.id} has no resolved SKU — skipping (treating as valid)`,
+          // Should be impossible now thanks to the SKU-mapping gate above —
+          // but if a race somehow leaves an unmapped line item, refuse to
+          // proceed instead of silently rubber-stamping it.
+          throw new Error(
+            `Line item ${lineItem.id} on PO ${po.poNumber} has no resolved SKU — refusing to validate.`,
           );
-          lineItem.validationStatus = LineItemValidationStatus.VALID;
-          await this.lineItemRepo.save(lineItem);
-          lineResults.push({
-            lineItemId: lineItem.id,
-            skuCode: lineItem.itemCode || 'UNKNOWN',
-            poPrice: Number(lineItem.poPrice),
-            calculatedPrice: Number(lineItem.poPrice),
-            variance: 0,
-            status: LineItemValidationStatus.VALID,
-          });
-          continue;
         }
 
         const calculated = await this.pricingService.calculatePrice(
@@ -176,7 +195,10 @@ export class ValidationService implements OnModuleInit {
       } catch (error) {
         const msg = String(error);
         // If no pricing rule is configured yet, skip validation (treat as valid)
-        if (msg.includes('No active pricing rule') || msg.includes('pricing rule not found')) {
+        if (
+          msg.includes('No active pricing rule') ||
+          msg.includes('pricing rule not found')
+        ) {
           this.logger.warn(
             `No pricing rule for line item ${lineItem.id} — skipping (treating as valid)`,
           );
@@ -219,8 +241,7 @@ export class ValidationService implements OnModuleInit {
 
       // Send email to vendor
       const vendorEmail =
-        po.vendor?.email ||
-        (po.extractedData?.emailFrom as string | undefined);
+        po.vendor?.email || (po.extractedData?.emailFrom as string | undefined);
       if (vendorEmail) {
         try {
           await this.emailService.sendEmail(
@@ -228,12 +249,18 @@ export class ValidationService implements OnModuleInit {
             `[Action Required] Price mismatch on PO ${po.poNumber}`,
             this.buildMismatchEmailHtml(po, mismatchItems),
           );
-          this.logger.log(`Mismatch email sent to ${vendorEmail} for PO ${po.poNumber}`);
+          this.logger.log(
+            `Mismatch email sent to ${vendorEmail} for PO ${po.poNumber}`,
+          );
         } catch (emailErr) {
-          this.logger.warn(`Failed to send mismatch email (non-fatal): ${emailErr}`);
+          this.logger.warn(
+            `Failed to send mismatch email (non-fatal): ${emailErr}`,
+          );
         }
       } else {
-        this.logger.warn(`No vendor email found for PO ${po.poNumber}, skipping mismatch email`);
+        this.logger.warn(
+          `No vendor email found for PO ${po.poNumber}, skipping mismatch email`,
+        );
       }
     }
 
@@ -265,7 +292,7 @@ export class ValidationService implements OnModuleInit {
     // PDF didn't carry an explicit delivery date.
     const dispatchDate = po.expectedDeliveryDate
       ? (() => {
-          const d = new Date(po.expectedDeliveryDate as Date);
+          const d = new Date(po.expectedDeliveryDate);
           d.setHours(0, 0, 0, 0);
           return d;
         })()
@@ -286,7 +313,13 @@ export class ValidationService implements OnModuleInit {
     // Build SKU aggregation
     const skuMap = new Map<
       string,
-      { skuId: string; skuCode: string; skuName: string; totalPacks: number; packSize: number }
+      {
+        skuId: string;
+        skuCode: string;
+        skuName: string;
+        totalPacks: number;
+        packSize: number;
+      }
     >();
     for (const li of lineItems) {
       const key = li.skuId || li.itemCode;
@@ -325,9 +358,18 @@ export class ValidationService implements OnModuleInit {
         }
       }
       consolidation.items = existingItems;
-      consolidation.totalPacks = existingItems.reduce((s, i) => s + i.totalPacks, 0);
-      consolidation.totalEggs = existingItems.reduce((s, i) => s + i.totalEggs, 0);
-      consolidation.totalCrates = existingItems.reduce((s, i) => s + i.requiredCrates, 0);
+      consolidation.totalPacks = existingItems.reduce(
+        (s, i) => s + i.totalPacks,
+        0,
+      );
+      consolidation.totalEggs = existingItems.reduce(
+        (s, i) => s + i.totalEggs,
+        0,
+      );
+      consolidation.totalCrates = existingItems.reduce(
+        (s, i) => s + i.requiredCrates,
+        0,
+      );
       const poIds: string[] = (consolidation.poIds as any) || [];
       if (!poIds.includes(po.id)) poIds.push(po.id);
       consolidation.poIds = poIds;
@@ -356,11 +398,15 @@ export class ValidationService implements OnModuleInit {
 
     if (!existingDelivery) {
       // Try to find a matching route whose stops include this shipping location
-      const allRoutes = await this.routeRepo.find({ where: { isActive: true } });
-      const route = allRoutes.find((r) =>
-        Array.isArray(r.stops) && r.stops.some(
-          (stop) => stop.toLowerCase() === po.shippingLocation.toLowerCase(),
-        ),
+      const allRoutes = await this.routeRepo.find({
+        where: { isActive: true },
+      });
+      const route = allRoutes.find(
+        (r) =>
+          Array.isArray(r.stops) &&
+          r.stops.some(
+            (stop) => stop.toLowerCase() === po.shippingLocation.toLowerCase(),
+          ),
       );
 
       // Include all line items; skuId is now nullable in the DB
@@ -376,7 +422,9 @@ export class ValidationService implements OnModuleInit {
       );
 
       if (lineItems.every((li) => !li.skuId)) {
-        this.logger.warn(`PO ${po.poNumber} has no SKU-linked line items — delivery created with item codes only`);
+        this.logger.warn(
+          `PO ${po.poNumber} has no SKU-linked line items — delivery created with item codes only`,
+        );
       }
 
       const delivery = this.deliveryRepo.create({

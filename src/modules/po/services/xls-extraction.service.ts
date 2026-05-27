@@ -5,6 +5,7 @@ import {
   ExtractedLineItem,
 } from './pdf-extraction.service';
 import { isOwnCompanyName } from './own-company';
+import { isGarbageCustomerLabel } from '../../../common/utils/customer-name.util';
 
 /**
  * XLS Extraction Service
@@ -54,11 +55,37 @@ export class XlsExtractionService {
         break;
     }
 
+    if (result.vendorName && this.isGarbageVendorLabel(result.vendorName)) {
+      result.vendorName = '';
+    }
+    if (!result.vendorName?.trim()) {
+      const fromSheet = this.findCloudstoreBuyerInRows(rows);
+      if (fromSheet) result.vendorName = fromSheet;
+    }
+
     this.logger.log(
       `Extracted PO ${result.poNumber} with ${result.lineItems.length} line items from XLS`,
     );
 
     return result;
+  }
+
+  private isGarbageVendorLabel(name: string): boolean {
+    return isGarbageCustomerLabel(name);
+  }
+
+  private findCloudstoreBuyerInRows(
+    rows: (string | number | undefined)[][],
+  ): string {
+    for (const row of rows) {
+      for (const cell of row) {
+        const s = String(cell ?? '');
+        if (/CLOUDSTORE\s+RETAIL\s+PRIVATE\s+LIMITED/i.test(s)) {
+          return 'Cloudstore Retail Private Limited';
+        }
+      }
+    }
+    return '';
   }
 
   private detectFormat(rows: (string | number | undefined)[][]): string {
