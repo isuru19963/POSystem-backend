@@ -100,6 +100,14 @@ export class GrnController {
     return this.grnService.compareByPoNumber(poNumber);
   }
 
+  /**
+   * Backfill: mark PO + deliveries as delivered for every PO that already has a GRN.
+   */
+  @Post('sync-delivered-from-grns')
+  syncDeliveredFromExistingGrns() {
+    return this.grnService.backfillDeliveredStatusFromExistingGrns();
+  }
+
   @Get(':id')
   findById(@Param('id', ParseUUIDPipe) id: string) {
     return this.grnService.findById(id);

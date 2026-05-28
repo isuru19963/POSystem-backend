@@ -6,7 +6,9 @@ import {
   GrnLineItem,
   GrnStatus,
   PurchaseOrder,
+  PoStatus,
   Delivery,
+  DispatchStatus,
 } from '../../../database/entities';
 import { AlertsService } from '../../alerts/services/alerts.service';
 import { AlertType } from '../../../database/entities';
@@ -40,6 +42,17 @@ function parseFlexibleDate(dateStr?: string): Date | undefined {
   return parsed;
 }
 
+export interface SyncDeliveredStatusResult {
+  poUpdated: boolean;
+  deliveriesUpdated: number;
+}
+
+export interface BackfillDeliveredFromGrnsResult {
+  purchaseOrdersChecked: number;
+  purchaseOrdersMarkedDelivered: number;
+  deliveriesMarkedDelivered: number;
+}
+
 export interface ThreeWayMatchResult {
   grnId: string;
   poNumber: string;
@@ -71,6 +84,76 @@ export class GrnService {
     private readonly alertsService: AlertsService,
     private readonly grnPdfService: GrnPdfExtractionService,
   ) {}
+
+  /**
+   * When a GRN is linked to a PO, mark the PO and its deliveries as delivered.
+   */
+  async syncDeliveredStatusForPo(
+    purchaseOrderId: string,
+  ): Promise<SyncDeliveredStatusResult> {
+    const result: SyncDeliveredStatusResult = {
+      poUpdated: false,
+      deliveriesUpdated: 0,
+    };
+
+    const po = await this.poRepo.findOne({ where: { id: purchaseOrderId } });
+    if (!po) return result;
+
+    if (po.status !== PoStatus.COMPLETED && po.status !== PoStatus.REJECTED) {
+      if (po.status !== PoStatus.DELIVERED) {
+        po.status = PoStatus.DELIVERED;
+        await this.poRepo.save(po);
+        result.poUpdated = true;
+        this.logger.log(`PO ${po.poNumber} marked delivered (GRN received)`);
+      }
+    }
+
+    const deliveries = await this.deliveryRepo.find({
+      where: { purchaseOrderId },
+    });
+    for (const delivery of deliveries) {
+      if (delivery.status === DispatchStatus.DELIVERED) continue;
+      delivery.status = DispatchStatus.DELIVERED;
+      if (!delivery.actualDeliveryDate) {
+        delivery.actualDeliveryDate = new Date();
+      }
+      await this.deliveryRepo.save(delivery);
+      result.deliveriesUpdated += 1;
+      this.logger.log(
+        `Delivery ${delivery.id} marked delivered (GRN for PO ${po.poNumber})`,
+      );
+    }
+
+    return result;
+  }
+
+  /**
+   * One-time / on-demand: for every PO that already has at least one GRN,
+   * apply delivered status to the PO and its deliveries.
+   */
+  async backfillDeliveredStatusFromExistingGrns(): Promise<BackfillDeliveredFromGrnsResult> {
+    const rows = await this.grnRepo
+      .createQueryBuilder('g')
+      .select('DISTINCT g.purchase_order_id', 'purchaseOrderId')
+      .getRawMany<{ purchaseOrderId: string }>();
+
+    let purchaseOrdersMarkedDelivered = 0;
+    let deliveriesMarkedDelivered = 0;
+
+    for (const row of rows) {
+      const purchaseOrderId = row.purchaseOrderId;
+      if (!purchaseOrderId) continue;
+      const sync = await this.syncDeliveredStatusForPo(purchaseOrderId);
+      if (sync.poUpdated) purchaseOrdersMarkedDelivered += 1;
+      deliveriesMarkedDelivered += sync.deliveriesUpdated;
+    }
+
+    return {
+      purchaseOrdersChecked: rows.length,
+      purchaseOrdersMarkedDelivered,
+      deliveriesMarkedDelivered,
+    };
+  }
 
   /**
    * Perform 3-way matching: PO vs Delivered vs GRN
@@ -179,13 +262,22 @@ export class GrnService {
       ),
     });
 
-    return this.grnRepo.save(grn);
+    const saved = await this.grnRepo.save(grn);
+    await this.syncDeliveredStatusForPo(saved.purchaseOrderId);
+    return saved;
   }
 
   async findById(id: string): Promise<Grn> {
     const grn = await this.grnRepo.findOne({
       where: { id },
-      relations: ['purchaseOrder', 'lineItems', 'lineItems.sku'],
+      relations: [
+        'purchaseOrder',
+        'purchaseOrder.vendor',
+        'purchaseOrder.lineItems',
+        'purchaseOrder.lineItems.sku',
+        'lineItems',
+        'lineItems.sku',
+      ],
     });
     if (!grn) throw new NotFoundException(`GRN ${id} not found`);
     return grn;
@@ -207,7 +299,13 @@ export class GrnService {
 
   async findAll(): Promise<Grn[]> {
     return this.grnRepo.find({
-      relations: ['purchaseOrder', 'lineItems'],
+      relations: [
+        'purchaseOrder',
+        'purchaseOrder.vendor',
+        'purchaseOrder.lineItems',
+        'lineItems',
+        'lineItems.sku',
+      ],
       order: { createdAt: 'DESC' },
     });
   }
@@ -293,6 +391,7 @@ export class GrnService {
       const byEmail = await this.findByEmailMessageId(msgId);
       if (byEmail) {
         this.logger.log(`GRN email already processed (Message-Id): ${msgId}`);
+        await this.syncDeliveredStatusForPo(byEmail.purchaseOrderId);
         return byEmail;
       }
     }
@@ -361,6 +460,7 @@ export class GrnService {
     const existingNum = await this.grnRepo.findOne({ where: { grnNumber } });
     if (existingNum) {
       this.logger.warn(`GRN number ${grnNumber} already exists; skipping email import`);
+      await this.syncDeliveredStatusForPo(existingNum.purchaseOrderId);
       return existingNum;
     }
 
@@ -387,6 +487,7 @@ export class GrnService {
       await this.grnRepo.update(grn.id, { notes: importNote });
       grn.notes = importNote;
     }
+    await this.syncDeliveredStatusForPo(grn.purchaseOrderId);
     return grn;
   }
 
@@ -466,7 +567,9 @@ export class GrnService {
       }),
     });
 
-    return this.grnRepo.save(grn);
+    const saved = await this.grnRepo.save(grn);
+    await this.syncDeliveredStatusForPo(saved.purchaseOrderId);
+    return saved;
   }
 
   /**
